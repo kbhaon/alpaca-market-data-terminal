@@ -1,0 +1,7 @@
+alpaca-py
+streamlit
+pandas
+matplotlib
+plotly
+python-dotenv
+rapidfuzz

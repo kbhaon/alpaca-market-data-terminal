@@ -1,0 +1,14 @@
+name: finm250-alpaca-terminal
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - streamlit
+  - pandas
+  - matplotlib
+  - plotly
+  - python-dotenv
+  - pip
+  - pip:
+      - alpaca-py
+      - rapidfuzz
