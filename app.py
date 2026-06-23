@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import time
-
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -17,7 +15,8 @@ from src.live_quotes import get_latest_quote_trade
 
 st.set_page_config(page_title="Alpaca Market Data Terminal", layout="wide")
 
-MIN_REFRESH_SECONDS = 0.6
+
+LIVE_QUOTE_REFRESH_SECONDS = 1.0
 EASTERN_TZ = "America/New_York"
 
 
@@ -39,25 +38,38 @@ def resolve_range_days(selected_range: str, custom_days: int | None = None) -> i
     return RANGE_PRESETS[selected_range]
 
 
-def resolve_tick_spec(selected_tick: str, custom_tick: int | None = None) -> tuple[int, TimeFrameUnit, int]:
-    """Map a tick selector value to request timeframe and optional requested aggregate factor."""
+def resolve_tick_spec(
+    selected_tick: str,
+    custom_tick: int | None = None,
+) -> tuple[int, TimeFrameUnit, int]:
+    """Map a tick selector value to request timeframe and optional aggregate factor."""
     if selected_tick == "Custom":
         custom_tick_minutes = int(custom_tick or 1)
+
         if custom_tick_minutes <= 59:
             return custom_tick_minutes, TimeFrameUnit.Minute, 1
+
         if custom_tick_minutes % 60 == 0:
             return custom_tick_minutes // 60, TimeFrameUnit.Hour, 1
-        raise ValueError("Custom tick must be 1-59 minutes or a whole-hour minute value (60, 120, 180, ...).")
+
+        raise ValueError(
+            "Custom tick must be 1-59 minutes or a whole-hour minute value "
+            "(60, 120, 180, ...)."
+        )
 
     if selected_tick.endswith("m"):
         return int(selected_tick[:-1]), TimeFrameUnit.Minute, 1
+
     if selected_tick in {"1D", "5D"}:
         aggregate = 5 if selected_tick == "5D" else 1
         return 1, TimeFrameUnit.Day, aggregate
+
     if selected_tick in {"1M", "3M"}:
         return int(selected_tick[:-1]), TimeFrameUnit.Month, 1
+
     if selected_tick == "1h":
         return 1, TimeFrameUnit.Hour, 1
+
     return 1, TimeFrameUnit.Minute, 1
 
 
@@ -79,10 +91,14 @@ def aggregate_bars_by_days(df: pd.DataFrame, days: int) -> pd.DataFrame:
             }
         )
     )
+
     return resampled.dropna(subset=["open", "high", "low", "close"]).reset_index()
 
 
-def prepare_historical_display_df(df: pd.DataFrame, timeframe_unit: TimeFrameUnit) -> pd.DataFrame:
+def prepare_historical_display_df(
+    df: pd.DataFrame,
+    timeframe_unit: TimeFrameUnit,
+) -> pd.DataFrame:
     """Return a display copy with chart timestamps shown in Eastern time."""
     if df.empty or "timestamp" not in df.columns:
         return df
@@ -91,7 +107,9 @@ def prepare_historical_display_df(df: pd.DataFrame, timeframe_unit: TimeFrameUni
     timestamps = pd.to_datetime(display_df["timestamp"], utc=True)
 
     if timeframe_unit in {TimeFrameUnit.Minute, TimeFrameUnit.Hour}:
-        display_df["timestamp"] = timestamps.dt.tz_convert(EASTERN_TZ).dt.tz_localize(None)
+        display_df["timestamp"] = (
+            timestamps.dt.tz_convert(EASTERN_TZ).dt.tz_localize(None)
+        )
     else:
         display_df["timestamp"] = timestamps.dt.date
 
@@ -125,41 +143,79 @@ def render_invalid_symbol_message(target=st) -> None:
     )
 
 
+@st.fragment(run_every=LIVE_QUOTE_REFRESH_SECONDS)
+def render_live_quote(client, symbol: str, is_valid_symbol: bool) -> None:
+    """
+    Refresh only the live quote area.
+
+    This replaces the old full-app loop:
+
+        time.sleep(...)
+        st.rerun()
+
+    Because this is a fragment, only this function reruns on the timer.
+    """
+    if not is_valid_symbol:
+        st.info("No live quote for invalid symbol.")
+        return
+
+    try:
+        snapshot = get_latest_quote_trade(client=client, symbol=symbol)
+    except Exception as exc:
+        st.error(f"Could not load latest quote/trade: {exc}")
+        return
+
+    st.metric("Bid", snapshot.bid_display)
+    st.metric("Ask", snapshot.ask_display)
+    st.metric("Last", snapshot.last_trade_display)
+    st.caption(f"Updated at: {snapshot.updated_at_display}")
+
+
 st.title("Mini Market Data Terminal v1.0")
+
 
 if "ticker_input" not in st.session_state:
     st.session_state.ticker_input = "HOOD"
+
 if "selected_symbol" not in st.session_state:
     st.session_state.selected_symbol = st.session_state.ticker_input
+
 
 equity_choices: list[CompanyMatch] = get_company_choices()
 equity_by_label = {match.display: match for match in equity_choices}
 equity_by_symbol = {match.symbol: match for match in equity_choices}
+
 equity_placeholder = "Select or search an equity"
 equity_options = [equity_placeholder, *equity_by_label.keys()]
 
 
 def sync_from_equity() -> None:
     match = equity_by_label.get(st.session_state.equity_selection)
+
     if match is None:
         return
+
     st.session_state.selected_symbol = match.symbol
     st.session_state.ticker_input = match.symbol
 
 
 def sync_from_ticker() -> None:
     symbol = st.session_state.ticker_input.strip().upper()
+
     if symbol:
         st.session_state.selected_symbol = symbol
 
 
 current_symbol = st.session_state.selected_symbol.strip().upper()
 current_match = equity_by_symbol.get(current_symbol)
+
 st.session_state.ticker_input = current_symbol
+
 if current_match is not None:
     st.session_state.equity_selection = current_match.display
 else:
     st.session_state.equity_selection = equity_placeholder
+
 
 st.sidebar.selectbox(
     "Stocks & ETFs",
@@ -168,17 +224,22 @@ st.sidebar.selectbox(
     on_change=sync_from_equity,
 )
 
+
 symbol_input = st.sidebar.text_input(
     "Ticker",
     key="ticker_input",
     on_change=sync_from_ticker,
 )
+
 symbol_input = symbol_input.strip().upper()
+
 if symbol_input:
     st.session_state.selected_symbol = symbol_input
+
 symbol = symbol_input
 selected_match = equity_by_symbol.get(symbol)
 is_valid_symbol = bool(symbol) and (not equity_by_symbol or symbol in equity_by_symbol)
+
 
 time_range = st.sidebar.radio(
     "Time range",
@@ -186,10 +247,17 @@ time_range = st.sidebar.radio(
     index=0,
     horizontal=True,
 )
+
 if time_range == "Custom":
-    custom_days = st.sidebar.slider("Custom range (trading days)", min_value=1, max_value=365, value=30)
+    custom_days = st.sidebar.slider(
+        "Custom range (trading days)",
+        min_value=1,
+        max_value=365,
+        value=30,
+    )
 else:
     custom_days = None
+
 
 tick_choice = st.sidebar.radio(
     "Tick size",
@@ -197,17 +265,29 @@ tick_choice = st.sidebar.radio(
     index=1,
     horizontal=True,
 )
+
 if tick_choice == "Custom":
-    custom_tick = st.sidebar.slider("Custom tick size (minutes)", min_value=1, max_value=240, value=5)
+    custom_tick = st.sidebar.slider(
+        "Custom tick size (minutes)",
+        min_value=1,
+        max_value=240,
+        value=5,
+    )
 else:
     custom_tick = None
 
+
 days = resolve_range_days(time_range, custom_days)
+
 try:
-    timeframe_value, timeframe_unit, aggregate_factor = resolve_tick_spec(tick_choice, custom_tick)
+    timeframe_value, timeframe_unit, aggregate_factor = resolve_tick_spec(
+        tick_choice,
+        custom_tick,
+    )
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
+
 
 try:
     client = get_historical_client()
@@ -215,7 +295,9 @@ except ValueError as exc:
     st.error(str(exc))
     st.stop()
 
+
 left, right = st.columns([2, 1])
+
 
 with left:
     if not is_valid_symbol:
@@ -224,7 +306,9 @@ with left:
         company_name = selected_match.name
     else:
         company_name = get_company_name(symbol)
+
     st.subheader(f"{company_name} ({symbol})")
+
     chart_area = st.empty()
     table_area = st.empty()
 
@@ -232,13 +316,21 @@ with left:
         render_invalid_symbol_message(chart_area)
         table_area.markdown("")
     else:
-        requested_key = f"{symbol}|{days}|{timeframe_value}|{timeframe_unit.value}|{aggregate_factor}"
-        has_data = "historical_df" in st.session_state and st.session_state.get("historical_key") == requested_key
+        requested_key = (
+            f"{symbol}|{days}|{timeframe_value}|"
+            f"{timeframe_unit.value}|{aggregate_factor}"
+        )
+
+        has_data = (
+            "historical_df" in st.session_state
+            and st.session_state.get("historical_key") == requested_key
+        )
 
         if not has_data:
             with st.spinner("Loading historical bars..."):
                 request_value = timeframe_value
                 request_unit = timeframe_unit
+
                 if timeframe_unit == TimeFrameUnit.Day and aggregate_factor > 1:
                     request_value = 1
 
@@ -249,17 +341,21 @@ with left:
                     timeframe_value=request_value,
                     timeframe_unit=request_unit,
                 )
+
                 if timeframe_unit == TimeFrameUnit.Day and aggregate_factor > 1:
                     bars = aggregate_bars_by_days(bars, aggregate_factor)
+
                 st.session_state.historical_df = bars
                 st.session_state.historical_key = requested_key
 
         df = st.session_state.historical_df
+
         if df.empty:
             chart_area.warning("No historical bars returned for this symbol.")
             table_area.markdown("")
         else:
             display_df = prepare_historical_display_df(df, timeframe_unit)
+
             fig = make_subplots(
                 rows=2,
                 cols=1,
@@ -267,6 +363,7 @@ with left:
                 row_heights=[0.72, 0.28],
                 vertical_spacing=0.05,
             )
+
             fig.add_trace(
                 go.Candlestick(
                     x=display_df["timestamp"],
@@ -279,44 +376,40 @@ with left:
                 row=1,
                 col=1,
             )
+
             fig.add_trace(
-                go.Bar(x=display_df["timestamp"], y=display_df["volume"], name="Volume"),
+                go.Bar(
+                    x=display_df["timestamp"],
+                    y=display_df["volume"],
+                    name="Volume",
+                ),
                 row=2,
                 col=1,
             )
-            fig.update_layout(height=640, xaxis_rangeslider_visible=False)
-            fig.update_xaxes(title_text="Time (E.T.)", row=2, col=1)
-            chart_area.plotly_chart(fig, use_container_width=True)
-            table_area.dataframe(display_df.tail(50), use_container_width=True)
+
+            fig.update_layout(
+                height=640,
+                xaxis_rangeslider_visible=False,
+            )
+
+            fig.update_xaxes(
+                title_text="Time (E.T.)",
+                row=2,
+                col=1,
+            )
+
+            # Fixed deprecation warning:
+            # use_container_width=True -> width="stretch"
+            chart_area.plotly_chart(fig, width="stretch")
+
+            # Fixed deprecation warning:
+            # use_container_width=True -> width="stretch"
+            table_area.dataframe(display_df.tail(50), width="stretch")
+
 
 with right:
     st.subheader("Live Quote")
-    quote_message = st.empty()
-    bid_area = st.empty()
-    ask_area = st.empty()
-    last_area = st.empty()
-    quote_time_area = st.empty()
 
-    if not is_valid_symbol:
-        quote_message.info("No live quote for invalid symbol.")
-        bid_area.markdown("")
-        ask_area.markdown("")
-        last_area.markdown("")
-        quote_time_area.markdown("")
-    else:
-        quote_message.markdown("")
-        try:
-            snapshot = get_latest_quote_trade(client=client, symbol=symbol)
-        except Exception as exc:
-            bid_area.error(f"Could not load latest quote/trade: {exc}")
-            ask_area.markdown("")
-            last_area.markdown("")
-            quote_time_area.markdown("")
-        else:
-            bid_area.metric("Bid", snapshot.bid_display)
-            ask_area.metric("Ask", snapshot.ask_display)
-            last_area.metric("Last", snapshot.last_trade_display)
-            quote_time_area.caption(f"Updated at: {snapshot.updated_at_display}")
-
-    time.sleep(MIN_REFRESH_SECONDS)
-    st.rerun()
+    # Only this quote area refreshes automatically.
+    # The chart/table/sidebar will not refresh every second anymore.
+    render_live_quote(client, symbol, is_valid_symbol)
