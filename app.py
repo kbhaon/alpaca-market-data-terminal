@@ -10,7 +10,7 @@ from src.company import get_company_name
 from src.company_search import CompanyMatch, get_company_choices
 from src.data_connector import get_historical_client
 from src.historical import get_historical_bars
-from src.live_quotes import get_latest_quote_trade
+from src.live_quotes import get_live_quote_manager
 
 
 st.set_page_config(page_title="Alpaca Market Data Terminal", layout="wide")
@@ -144,31 +144,32 @@ def render_invalid_symbol_message(target=st) -> None:
 
 
 @st.fragment(run_every=LIVE_QUOTE_REFRESH_SECONDS)
-def render_live_quote(client, symbol: str, is_valid_symbol: bool) -> None:
+def render_live_quote(symbol: str, is_valid_symbol: bool) -> None:
     """
     Refresh only the live quote area.
 
-    This replaces the old full-app loop:
-
-        time.sleep(...)
-        st.rerun()
-
-    Because this is a fragment, only this function reruns on the timer.
+    Because this is a fragment, only this function reruns on the timer while
+    the Alpaca websocket stream keeps receiving quote and trade events.
     """
+    manager = get_live_quote_manager(st.session_state)
+
     if not is_valid_symbol:
+        manager.stop()
         st.info("No live quote for invalid symbol.")
         return
 
-    try:
-        snapshot = get_latest_quote_trade(client=client, symbol=symbol)
-    except Exception as exc:
-        st.error(f"Could not load latest quote/trade: {exc}")
+    snapshot = manager.get_snapshot(symbol)
+    if snapshot is None:
+        st.error(f"Could not start live quote stream: {manager.error}")
         return
 
     st.metric("Bid", snapshot.bid_display)
     st.metric("Ask", snapshot.ask_display)
     st.metric("Last", snapshot.last_trade_display)
-    st.caption(f"Updated at: {snapshot.updated_at_display}")
+    if snapshot.updated_at is None:
+        st.caption("Waiting for first streamed update.")
+    else:
+        st.caption(f"Updated at: {snapshot.updated_at_display}")
 
 
 st.title("Mini Market Data Terminal v1.0")
@@ -412,4 +413,4 @@ with right:
 
     # Only this quote area refreshes automatically.
     # The chart/table/sidebar will not refresh every second anymore.
-    render_live_quote(client, symbol, is_valid_symbol)
+    render_live_quote(symbol, is_valid_symbol)
