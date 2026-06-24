@@ -8,7 +8,7 @@ This project built a terminal that connects to Alpaca market data, retrieves his
 
 ## Demo Video
 
-Demo video: [add link here]
+Demo video: https://youtu.be/Zx6PTew7rmc?si=mOBUHANlP98lEoAR
 
 ## Setup
 
