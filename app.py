@@ -21,21 +21,39 @@ EASTERN_TZ = "America/New_York"
 
 
 RANGE_PRESETS = {
-    "1D": 1,
-    "5D": 5,
-    "1M": 21,
-    "3M": 63,
-    "6M": 126,
-    "1Y": 252,
-    "5Y": 1260,
+    "1D": pd.DateOffset(days=1),
+    "5D": pd.DateOffset(days=5),
+    "1M": pd.DateOffset(months=1),
+    "3M": pd.DateOffset(months=3),
+    "6M": pd.DateOffset(months=6),
+    "1Y": pd.DateOffset(years=1),
+    "5Y": pd.DateOffset(years=5),
 }
 
 
-def resolve_range_days(selected_range: str, custom_days: int | None = None) -> int:
-    """Map a range button to number of lookback trading days."""
+def resolve_date_range(
+    selected_range: str,
+    custom_days: int | None = None,
+    end: pd.Timestamp | None = None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Map a range button to an explicit calendar start/end range."""
+    resolved_end = (
+        pd.Timestamp(end)
+        if end is not None
+        else pd.Timestamp.now(tz="UTC").floor("min")
+    )
+
+    if resolved_end.tzinfo is None:
+        resolved_end = resolved_end.tz_localize("UTC")
+    else:
+        resolved_end = resolved_end.tz_convert("UTC")
+
     if selected_range == "Custom":
-        return int(custom_days or 30)
-    return RANGE_PRESETS[selected_range]
+        offset = pd.DateOffset(days=int(custom_days or 30))
+    else:
+        offset = RANGE_PRESETS[selected_range]
+
+    return resolved_end - offset, resolved_end
 
 
 def resolve_tick_spec(
@@ -251,9 +269,9 @@ time_range = st.sidebar.radio(
 
 if time_range == "Custom":
     custom_days = st.sidebar.slider(
-        "Custom range (trading days)",
+        "Custom range (calendar days)",
         min_value=1,
-        max_value=365,
+        max_value=1827,
         value=30,
     )
 else:
@@ -278,7 +296,7 @@ else:
     custom_tick = None
 
 
-days = resolve_range_days(time_range, custom_days)
+range_start, range_end = resolve_date_range(time_range, custom_days)
 
 try:
     timeframe_value, timeframe_unit, aggregate_factor = resolve_tick_spec(
@@ -318,7 +336,8 @@ with left:
         table_area.markdown("")
     else:
         requested_key = (
-            f"{symbol}|{days}|{timeframe_value}|"
+            f"{symbol}|{range_start.isoformat()}|{range_end.isoformat()}|"
+            f"{timeframe_value}|"
             f"{timeframe_unit.value}|{aggregate_factor}"
         )
 
@@ -338,9 +357,10 @@ with left:
                 bars = get_historical_bars(
                     client=client,
                     symbol=symbol,
-                    days=days,
                     timeframe_value=request_value,
                     timeframe_unit=request_unit,
+                    start=range_start.to_pydatetime(),
+                    end=range_end.to_pydatetime(),
                 )
 
                 if timeframe_unit == TimeFrameUnit.Day and aggregate_factor > 1:
