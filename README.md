@@ -18,7 +18,7 @@ The repository currently contains two Streamlit apps:
 
 ## Demo Video
 
-Market data terminal: https://youtu.be/Zx6PTew7rmc?si=mOBUHANlP98lEoAR
+Market data terminal: https://youtu.be/Zx6PTew7rmc
 
 Strategy backtester: https://youtu.be/NmMOAOslkIA
 
