@@ -1,15 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator
 from sklearn.linear_model import LogisticRegression
 
-from src.features import (
-    PCAFeatureResult,
-    build_feature_pca_pipeline,
-    build_ml_features,
-)
+from src.features import PCAFeatureResult
 
 
 # Assignment probability threshold:
@@ -23,6 +21,18 @@ ML_BUY_SIGNAL_COL = "ml_buy_signal"
 ML_SELL_SIGNAL_COL = "ml_sell_signal"
 
 
+@dataclass(frozen=True)
+class MLSignalResult:
+    """Container for the trained classifier and its signal DataFrame."""
+
+    signal_df: pd.DataFrame
+    pca_result: PCAFeatureResult
+    model: BaseEstimator
+    component_columns: list[str]
+    probability_threshold: float
+    trade_on_test_only: bool
+
+
 def train_classifier(
     pca_result: PCAFeatureResult,
     classifier: BaseEstimator | None = None,
@@ -30,8 +40,8 @@ def train_classifier(
     """
     Train the assignment classifier on PCA components.
 
-    This version uses Logistic Regression by default instead of Random Forest.
-    The model is trained on PCA-transformed features.
+    This module starts after feature engineering/PCA. It does not build
+    features, scale raw inputs, or fit PCA.
     """
 
     if pca_result.y_train.nunique() < 2:
@@ -74,150 +84,30 @@ def _positive_class_probability(model: BaseEstimator, X: pd.DataFrame) -> np.nda
     return probabilities[:, positive_class_position]
 
 
-def run_ml_signal_pipeline(
-    df: pd.DataFrame,
-    price_col: str = "close",
-    probability_threshold: float = PROBABILITY_THRESHOLD,
-    test_size: float = 0.20,
-    variance_threshold: float = 0.80,
-    classifier: BaseEstimator | None = None,
-    trade_on_test_only: bool = True,
+def _build_signal_frame(
+    pca_result: PCAFeatureResult,
+    probability_threshold: float,
+    model: BaseEstimator,
+    trade_on_test_only: bool,
 ) -> pd.DataFrame:
-    """
-    End-to-end ML signal pipeline.
-
-    Steps:
-        1. Build technical indicator features.
-        2. Define binary target:
-               target = 1 if next-day return > 0 else 0
-        3. Standardize features.
-        4. Apply PCA.
-        5. Keep PCA components explaining at least 80% of variance.
-        6. Train Logistic Regression on PCA components.
-        7. Predict probability of next-day positive return.
-        8. Generate signal:
-               Long if probability > 0.60
-               Flat if probability <= 0.60
-
-    Output columns are compatible with the backtester through:
-
-        ml_position
-        ml_trade_signal
-        ml_buy_signal
-        ml_sell_signal
-    """
-
-    if not 0 < probability_threshold < 1:
-        raise ValueError("probability_threshold must be between 0 and 1.")
-
-    # ------------------------------------------------------------------
-    # 1. Feature engineering and target creation
-    # ------------------------------------------------------------------
-    result = build_ml_features(df, price_col=price_col)
-
-    # ------------------------------------------------------------------
-    # 2. Standardization + PCA pipeline
-    # ------------------------------------------------------------------
-    pca_result = build_feature_pca_pipeline(
-        result,
-        price_col=price_col,
-        test_size=test_size,
-        variance_threshold=variance_threshold,
-    )
-
-    # ------------------------------------------------------------------
-    # 3. Train Logistic Regression model
-    # ------------------------------------------------------------------
-    model = train_classifier(pca_result, classifier=classifier)
-
-    # ------------------------------------------------------------------
-    # 4. Predict probabilities using PCA components
-    # ------------------------------------------------------------------
-    pca_input = pca_result.data[pca_result.pca_columns]
-
-    positive_probability = _positive_class_probability(model, pca_input)
-
-    raw_signal = (positive_probability > probability_threshold).astype(int)
-    predicted_target = (positive_probability >= 0.50).astype(int)
-
-    # ------------------------------------------------------------------
-    # 5. Initialize ML output columns
-    # ------------------------------------------------------------------
-    result["ml_probability"] = np.nan
-    result["ml_predicted_target"] = np.nan
-    result["ml_raw_signal"] = 0
-    result["ml_signal"] = "Flat"
-    result["ml_sample_type"] = "not_ready"
-
-    # Add PCA component columns back into the main result DataFrame
-    for column in pca_result.pca_columns:
-        result[column] = np.nan
-        result.loc[pca_result.data.index, column] = pca_result.data[column]
-
-    # ------------------------------------------------------------------
-    # 6. Store model predictions/signals
-    # ------------------------------------------------------------------
-    prediction_index = pca_result.data.index
-
-    result.loc[prediction_index, "ml_probability"] = positive_probability
-    result.loc[prediction_index, "ml_predicted_target"] = predicted_target
-    result.loc[prediction_index, "ml_raw_signal"] = raw_signal
-    result.loc[prediction_index, "ml_signal"] = np.where(raw_signal == 1, "Long", "Flat")
-
-    # Mark rows as train/test/latest
-    result.loc[pca_result.train_index, "ml_sample_type"] = "train"
-    result.loc[pca_result.test_index, "ml_sample_type"] = "test"
-
     latest_unlabeled_index = pca_result.data.index[pca_result.data["target"].isna()]
-    result.loc[latest_unlabeled_index, "ml_sample_type"] = "latest_unlabeled"
-
-    # ------------------------------------------------------------------
-    # 7. Decide which rows are eligible for trading
-    # ------------------------------------------------------------------
-    # For a realistic backtest, only trade on the test set.
-    # The latest unlabeled row is included so paper-trading can use the
-    # most recent signal.
     if trade_on_test_only:
         eligible_index = pca_result.test_index.union(latest_unlabeled_index)
     else:
-        eligible_index = prediction_index
+        eligible_index = pca_result.data.index
 
-    result[ML_POSITION_COL] = 0
-    result.loc[eligible_index, ML_POSITION_COL] = (
-        result.loc[eligible_index, "ml_raw_signal"].astype(int)
+    result = score_pca_features(
+        pca_frame=pca_result.data,
+        component_columns=pca_result.pca_columns,
+        model=model,
+        probability_threshold=probability_threshold,
+        eligible_index=eligible_index,
     )
-    result[ML_POSITION_COL] = result[ML_POSITION_COL].fillna(0).astype(int)
+    result["ml_sample_type"] = "not_ready"
+    result.loc[pca_result.train_index, "ml_sample_type"] = "train"
+    result.loc[pca_result.test_index, "ml_sample_type"] = "test"
+    result.loc[latest_unlabeled_index, "ml_sample_type"] = "latest_unlabeled"
 
-    # ------------------------------------------------------------------
-    # 8. Convert position into trade signals
-    # ------------------------------------------------------------------
-    # ml_position:
-    #     1 = Long
-    #     0 = Flat
-    #
-    # ml_trade_signal:
-    #     1  = Buy
-    #    -1  = Sell
-    #     0  = Hold current state
-    result[ML_TRADE_SIGNAL_COL] = (
-        result[ML_POSITION_COL]
-        .diff()
-        .fillna(result[ML_POSITION_COL])
-        .astype(int)
-    )
-
-    result[ML_BUY_SIGNAL_COL] = result[ML_TRADE_SIGNAL_COL] == 1
-    result[ML_SELL_SIGNAL_COL] = result[ML_TRADE_SIGNAL_COL] == -1
-
-    # Helpful generic aliases for logs or paper-trading scripts.
-    result["position"] = result[ML_POSITION_COL]
-    result["trade_signal"] = result[ML_TRADE_SIGNAL_COL]
-    result["buy_signal"] = result[ML_BUY_SIGNAL_COL]
-    result["sell_signal"] = result[ML_SELL_SIGNAL_COL]
-
-    # ------------------------------------------------------------------
-    # 9. Store metadata for display/debugging
-    # ------------------------------------------------------------------
     result.attrs["ml_feature_columns"] = pca_result.feature_columns
     result.attrs["ml_pca_columns"] = pca_result.pca_columns
     result.attrs["ml_pca_explained_variance_ratio"] = (
@@ -233,27 +123,146 @@ def run_ml_signal_pipeline(
     return result
 
 
-def generate_ml_signals(
-    df: pd.DataFrame,
-    price_col: str = "close",
+def score_pca_features(
+    pca_frame: pd.DataFrame,
+    component_columns: list[str],
+    model: BaseEstimator,
     probability_threshold: float = PROBABILITY_THRESHOLD,
-    test_size: float = 0.20,
-    variance_threshold: float = 0.80,
+    eligible_index: pd.Index | None = None,
+) -> pd.DataFrame:
+    """Score any PCA-ready frame and append the standard ML signal columns."""
+
+    if not 0 < probability_threshold < 1:
+        raise ValueError("probability_threshold must be between 0 and 1.")
+
+    missing_components = [
+        column for column in component_columns if column not in pca_frame.columns
+    ]
+    if missing_components:
+        raise ValueError(f"Missing PCA component columns: {missing_components}")
+
+    result = pca_frame.copy()
+    probabilities = _positive_class_probability(model, result[component_columns])
+    raw_signal = (probabilities > probability_threshold).astype(int)
+
+    if eligible_index is None:
+        eligible_index = result.index
+    else:
+        eligible_index = result.index.intersection(eligible_index)
+
+    result["ml_probability"] = probabilities
+    result["ml_predicted_target"] = (probabilities >= 0.50).astype(int)
+    result["ml_raw_signal"] = raw_signal
+    result["ml_signal"] = np.where(raw_signal == 1, "Long", "Flat")
+    result[ML_POSITION_COL] = 0
+    result.loc[eligible_index, ML_POSITION_COL] = (
+        result.loc[eligible_index, "ml_raw_signal"].astype(int)
+    )
+    result[ML_POSITION_COL] = result[ML_POSITION_COL].fillna(0).astype(int)
+    result[ML_TRADE_SIGNAL_COL] = (
+        result[ML_POSITION_COL]
+        .diff()
+        .fillna(result[ML_POSITION_COL])
+        .astype(int)
+    )
+    result[ML_BUY_SIGNAL_COL] = result[ML_TRADE_SIGNAL_COL] == 1
+    result[ML_SELL_SIGNAL_COL] = result[ML_TRADE_SIGNAL_COL] == -1
+
+    result["position"] = result[ML_POSITION_COL]
+    result["trade_signal"] = result[ML_TRADE_SIGNAL_COL]
+    result["buy_signal"] = result[ML_BUY_SIGNAL_COL]
+    result["sell_signal"] = result[ML_SELL_SIGNAL_COL]
+
+    return result
+
+
+def run_ml_signal_pipeline(
+    pca_result: PCAFeatureResult,
+    probability_threshold: float = PROBABILITY_THRESHOLD,
+    classifier: BaseEstimator | None = None,
+    trade_on_test_only: bool = True,
+) -> MLSignalResult:
+    """
+    Train Logistic Regression on PCA components and generate long/flat signals.
+
+    Input must come from src.features.build_feature_pca_pipeline() or another
+    object with the same PCAFeatureResult contract.
+    """
+
+    if not isinstance(pca_result, PCAFeatureResult):
+        raise TypeError(
+            "run_ml_signal_pipeline expects a PCAFeatureResult. Build features/PCA in "
+            "src.features before calling src.models."
+        )
+    if not 0 < probability_threshold < 1:
+        raise ValueError("probability_threshold must be between 0 and 1.")
+
+    model = train_classifier(pca_result, classifier=classifier)
+    signal_df = _build_signal_frame(
+        pca_result=pca_result,
+        probability_threshold=probability_threshold,
+        model=model,
+        trade_on_test_only=trade_on_test_only,
+    )
+
+    return MLSignalResult(
+        signal_df=signal_df,
+        pca_result=pca_result,
+        model=model,
+        component_columns=pca_result.pca_columns.copy(),
+        probability_threshold=probability_threshold,
+        trade_on_test_only=trade_on_test_only,
+    )
+
+
+def generate_ml_signals(
+    pca_result: PCAFeatureResult,
+    probability_threshold: float = PROBABILITY_THRESHOLD,
     classifier: BaseEstimator | None = None,
     trade_on_test_only: bool = True,
 ) -> pd.DataFrame:
-    """
-    Convenience wrapper used by the app, backtester, or paper-trading script.
-
-    This simply calls run_ml_signal_pipeline().
-    """
+    """Compatibility wrapper that returns only the generated signal DataFrame."""
 
     return run_ml_signal_pipeline(
-        df=df,
-        price_col=price_col,
+        pca_result=pca_result,
         probability_threshold=probability_threshold,
-        test_size=test_size,
-        variance_threshold=variance_threshold,
         classifier=classifier,
         trade_on_test_only=trade_on_test_only,
+    ).signal_df
+
+
+def predict_latest_signal(
+    model_result: MLSignalResult,
+    pca_frame: pd.DataFrame | None = None,
+) -> dict[str, object]:
+    """Return the latest model-generated long/flat signal as a small dict."""
+
+    signal_df = model_result.signal_df
+    if pca_frame is not None:
+        signal_df = score_pca_features(
+            pca_frame=pca_frame,
+            component_columns=model_result.component_columns,
+            model=model_result.model,
+            probability_threshold=model_result.probability_threshold,
+        )
+
+    ready = signal_df.dropna(subset=["ml_probability", ML_POSITION_COL])
+    if ready.empty:
+        raise ValueError("ML signal result does not contain a usable latest signal row.")
+
+    latest = ready.iloc[-1]
+    timestamp = latest["timestamp"] if "timestamp" in ready.columns else None
+    trade_signal = (
+        int(latest[ML_TRADE_SIGNAL_COL])
+        if pd.notna(latest.get(ML_TRADE_SIGNAL_COL))
+        else None
     )
+
+    return {
+        "timestamp": timestamp,
+        "close": float(latest["close"]) if pd.notna(latest["close"]) else None,
+        "probability": float(latest["ml_probability"]),
+        "position": int(latest[ML_POSITION_COL]),
+        "trade_signal": trade_signal,
+        "label": "LONG" if int(latest[ML_POSITION_COL]) == 1 else "FLAT",
+    }

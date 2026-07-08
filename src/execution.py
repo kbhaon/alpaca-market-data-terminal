@@ -4,6 +4,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from alpaca.common.exceptions import APIError
@@ -11,45 +12,53 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
-from src.config import AlpacaSettings, get_settings
-from src.historical import fetch_daily_ohlcv
+from src.config import AlpacaSettings
+from src.data_connector import get_paper_trading_client
 
-
-# No switch for live env. only paper trading
-PAPER_ONLY = True
 
 DEFAULT_ORDER_NOTIONAL = 10_000.0
-DEFAULT_HISTORY_YEARS = 5
-DEFAULT_PROBABILITY_THRESHOLD = 0.6
 
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "paper_trading.log"
 
-_ML_CONTRACT_HINT = (
-    "src/features.py and src/models.py are placeholders and do not implement "
-    "add_ml_features / generate_ml_signals yet."
-)
+
+@dataclass(frozen=True)
+class OrderPlan:
+    symbol: str
+    action: str
+    side: str | None
+    quantity: float | None
+    latest_position: int
+    current_position: float
+    close_price: float
+    probability: float
+    bar_timestamp: pd.Timestamp | None
+    requested_notional: float
+    reason: str
 
 
 @dataclass(frozen=True)
 class ExecutionReport:
-    """Outcome of one execute_latest_signal() run, for display and submission logs."""
+    """Outcome of one paper-trading decision, for display and submission logs."""
 
     symbol: str
-    bar_timestamp: pd.Timestamp
+    bar_timestamp: pd.Timestamp | None
     close_price: float
     probability: float
-    signal: str  # "LONG" or "FLAT"
-    action: str  # "BUY", "SELL", "HOLD", or "NONE"
+    signal: str
+    action: str
+    current_position: float
     order_id: str | None = None
     order_status: str | None = None
     order_qty: float | None = None
     market_open: bool | None = None
+    dry_run: bool = False
+    message: str = ""
     log_lines: list[str] = field(default_factory=list)
 
 
 def get_paper_trading_logger() -> logging.Logger:
-    """Return a logger that writes signal/order events to console and logs/paper_trading.log."""
+    """Return a logger that writes signal and order events to logs/paper_trading.log."""
     logger = logging.getLogger("paper_trading")
 
     if not logger.handlers:
@@ -68,52 +77,195 @@ def get_paper_trading_logger() -> logging.Logger:
     return logger
 
 
-def get_trading_client(settings: AlpacaSettings | None = None) -> TradingClient:
-    """Build an Alpaca trading client locked to the paper environment."""
-    settings = settings or get_settings()
-    return TradingClient(settings.api_key, settings.secret_key, paper=PAPER_ONLY)
+def get_current_position(
+    symbol: str,
+    trading_client: TradingClient | None = None,
+) -> float:
+    """Return current paper shares for symbol, or 0 when there is no open position."""
+    client = trading_client or get_paper_trading_client()
 
-
-def _import_ml_pipeline():
-    # features/models are placeholder modules; import lazily so the app still loads.
-    try:
-        from src import features, models
-
-        add_ml_features = features.add_ml_features
-        generate_ml_signals = models.generate_ml_signals
-    except (ImportError, AttributeError) as exc:
-        raise ImportError(_ML_CONTRACT_HINT) from exc
-
-    threshold = getattr(models, "PROBABILITY_THRESHOLD", DEFAULT_PROBABILITY_THRESHOLD)
-    return add_ml_features, generate_ml_signals, threshold
-
-
-def _get_open_position_qty(client: TradingClient, symbol: str) -> float:
     try:
         position = client.get_open_position(symbol)
     except APIError:
         return 0.0
+
     return float(position.qty)
+
+
+def get_latest_signal(signal_df: pd.DataFrame) -> dict[str, Any]:
+    """Extract the latest usable ML signal row from a model-generated signal DataFrame."""
+    required_columns = {"close", "ml_probability", "ml_position"}
+    missing = sorted(required_columns - set(signal_df.columns))
+    if missing:
+        raise ValueError(f"Signal DataFrame is missing required columns: {missing}")
+
+    ready = signal_df.dropna(subset=["close", "ml_probability", "ml_position"])
+    if ready.empty:
+        raise ValueError("Signal DataFrame does not contain a usable latest signal row.")
+
+    latest = ready.iloc[-1]
+    timestamp = (
+        pd.Timestamp(latest["timestamp"])
+        if "timestamp" in ready.columns and pd.notna(latest["timestamp"])
+        else None
+    )
+    latest_position = int(latest["ml_position"])
+    probability = float(latest["ml_probability"])
+    close_price = float(latest["close"])
+    trade_signal = (
+        int(latest["ml_trade_signal"])
+        if "ml_trade_signal" in ready.columns and pd.notna(latest["ml_trade_signal"])
+        else None
+    )
+
+    return {
+        "timestamp": timestamp,
+        "close_price": close_price,
+        "probability": probability,
+        "position": latest_position,
+        "trade_signal": trade_signal,
+        "label": "LONG" if latest_position == 1 else "FLAT",
+    }
+
+
+def build_order_plan(
+    symbol: str,
+    latest_signal: dict[str, Any],
+    current_position: float,
+    notional: float = DEFAULT_ORDER_NOTIONAL,
+    available_cash: float | None = None,
+) -> OrderPlan:
+    """Convert latest long/flat signal and current paper position into an order plan."""
+    if notional <= 0:
+        raise ValueError("notional must be positive.")
+
+    close_price = float(latest_signal["close_price"])
+    if close_price <= 0:
+        raise ValueError("latest close price must be positive.")
+
+    latest_position = int(latest_signal["position"])
+    probability = float(latest_signal["probability"])
+    timestamp = latest_signal.get("timestamp")
+
+    if latest_position == 1 and current_position <= 0:
+        effective_notional = min(notional, available_cash) if available_cash is not None else notional
+        quantity = math.floor(effective_notional / close_price)
+
+        if quantity < 1:
+            return OrderPlan(
+                symbol=symbol,
+                action="NONE",
+                side=None,
+                quantity=None,
+                latest_position=latest_position,
+                current_position=current_position,
+                close_price=close_price,
+                probability=probability,
+                bar_timestamp=timestamp,
+                requested_notional=notional,
+                reason="LONG signal, but available cash is insufficient to buy one share.",
+            )
+
+        return OrderPlan(
+            symbol=symbol,
+            action="BUY",
+            side="buy",
+            quantity=float(quantity),
+            latest_position=latest_position,
+            current_position=current_position,
+            close_price=close_price,
+            probability=probability,
+            bar_timestamp=timestamp,
+            requested_notional=notional,
+            reason="LONG signal and no current paper position.",
+        )
+
+    if latest_position == 1 and current_position > 0:
+        return OrderPlan(
+            symbol=symbol,
+            action="HOLD",
+            side=None,
+            quantity=None,
+            latest_position=latest_position,
+            current_position=current_position,
+            close_price=close_price,
+            probability=probability,
+            bar_timestamp=timestamp,
+            requested_notional=notional,
+            reason="LONG signal and paper account already holds shares.",
+        )
+
+    if latest_position == 0 and current_position > 0:
+        return OrderPlan(
+            symbol=symbol,
+            action="SELL",
+            side="sell",
+            quantity=float(current_position),
+            latest_position=latest_position,
+            current_position=current_position,
+            close_price=close_price,
+            probability=probability,
+            bar_timestamp=timestamp,
+            requested_notional=notional,
+            reason="FLAT signal and paper account has an open position.",
+        )
+
+    return OrderPlan(
+        symbol=symbol,
+        action="NONE",
+        side=None,
+        quantity=None,
+        latest_position=latest_position,
+        current_position=current_position,
+        close_price=close_price,
+        probability=probability,
+        bar_timestamp=timestamp,
+        requested_notional=notional,
+        reason="FLAT signal and paper account is already flat.",
+    )
+
+
+def submit_paper_order(
+    order_plan: OrderPlan,
+    trading_client: TradingClient | None = None,
+) -> Any:
+    """Submit the market order described by an order plan to Alpaca paper trading."""
+    client = trading_client or get_paper_trading_client()
+
+    if order_plan.action == "BUY":
+        if order_plan.quantity is None:
+            raise ValueError("BUY order plan is missing quantity.")
+
+        return client.submit_order(
+            MarketOrderRequest(
+                symbol=order_plan.symbol,
+                qty=int(order_plan.quantity),
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            )
+        )
+
+    if order_plan.action == "SELL":
+        return client.close_position(order_plan.symbol)
+
+    return None
 
 
 def execute_latest_signal(
     symbol: str,
+    signal_df: pd.DataFrame,
     notional: float = DEFAULT_ORDER_NOTIONAL,
-    years: int = DEFAULT_HISTORY_YEARS,
     settings: AlpacaSettings | None = None,
     trading_client: TradingClient | None = None,
+    dry_run: bool = False,
 ) -> ExecutionReport:
     """
-    Run the full ML signal pipeline once and act on the latest signal.
+    Execute the latest model signal in Alpaca paper trading.
 
-    Fetch daily bars, compute features, apply PCA, generate the ML signal,
-    then reconcile with the current paper position:
-        LONG signal + no position  -> submit market BUY (paper only)
-        LONG signal + position     -> HOLD, no order
-        FLAT signal + position     -> close the position (market SELL)
-        FLAT signal + no position  -> no order
-
-    Long-only and unleveraged: the buy notional is capped at available cash.
+    This function intentionally does not fetch market data, compute features,
+    apply PCA, train a model, or generate ML signals. It receives the model
+    output and handles only paper-account inspection, order planning, order
+    submission, and logging.
     """
     logger = get_paper_trading_logger()
     log_lines: list[str] = []
@@ -122,100 +274,64 @@ def execute_latest_signal(
         logger.info(message)
         log_lines.append(message)
 
-    add_ml_features, generate_ml_signals, threshold = _import_ml_pipeline()
+    client = trading_client or get_paper_trading_client(settings)
+    latest_signal = get_latest_signal(signal_df)
+    signal_label = str(latest_signal["label"])
 
-    settings = settings or get_settings()
-    client = trading_client or get_trading_client(settings)
-
-    log(f"=== Paper trading run for {symbol} (paper={PAPER_ONLY}) ===")
-
-    bars = fetch_daily_ohlcv(symbol, years=years)
-    if bars.empty:
-        raise ValueError(f"No daily bars returned for {symbol}.")
-
-    feature_df = add_ml_features(bars)
-    signals = generate_ml_signals(feature_df, price_col="close")
-
-    latest = signals.iloc[-1]
-    bar_timestamp = pd.Timestamp(latest["timestamp"])
-    close_price = float(latest["close"])
-    probability = float(latest["ml_probability"])
-    is_long = int(latest["ml_position"]) == 1
-    signal_label = "LONG" if is_long else "FLAT"
-
+    log(f"=== Paper execution run for {symbol} ===")
     log(
-        f"Latest bar {bar_timestamp.date()} close={close_price:.2f} | "
-        f"P(next-day up)={probability:.4f} vs threshold {threshold:.2f} "
-        f"-> signal {signal_label}"
+        f"Latest signal: {signal_label} | "
+        f"P(next-day up)={float(latest_signal['probability']):.4f} | "
+        f"close={float(latest_signal['close_price']):.2f}"
     )
 
     clock = client.get_clock()
     log(f"Market open: {clock.is_open} (next open {clock.next_open}, next close {clock.next_close})")
 
-    held_qty = _get_open_position_qty(client, symbol)
-    log(f"Current paper position in {symbol}: {held_qty:g} shares")
+    current_position = get_current_position(symbol, trading_client=client)
+    log(f"Current paper position in {symbol}: {current_position:g} shares")
 
-    action = "NONE"
-    order = None
-    order_qty: float | None = None
-
-    if is_long and held_qty == 0:
+    available_cash = None
+    if int(latest_signal["position"]) == 1 and current_position <= 0:
         account = client.get_account()
         available_cash = float(account.cash)
-        effective_notional = min(notional, available_cash)
-        qty = math.floor(effective_notional / close_price)
 
-        if qty < 1:
-            log(
-                f"LONG signal but cannot afford one share "
-                f"(cash ${available_cash:,.2f}, close ${close_price:.2f}). No order."
-            )
-        else:
-            action = "BUY"
-            order_qty = float(qty)
-            order = client.submit_order(
-                MarketOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.BUY,
-                    time_in_force=TimeInForce.DAY,
-                )
-            )
-            log(
-                f"Submitted paper BUY {qty} {symbol} @ market "
-                f"(~${qty * close_price:,.2f}) | order id {order.id} | status {order.status}"
-            )
+    order_plan = build_order_plan(
+        symbol=symbol,
+        latest_signal=latest_signal,
+        current_position=current_position,
+        notional=notional,
+        available_cash=available_cash,
+    )
+    log(f"Order plan: {order_plan.action} | {order_plan.reason}")
 
-    elif is_long and held_qty > 0:
-        action = "HOLD"
-        log(f"LONG signal and already holding {held_qty:g} shares. No order.")
-
-    elif not is_long and held_qty > 0:
-        action = "SELL"
-        order_qty = held_qty
-        order = client.close_position(symbol)
+    order = None
+    if not dry_run and order_plan.action in {"BUY", "SELL"}:
+        order = submit_paper_order(order_plan, trading_client=client)
         log(
-            f"FLAT signal: closing {held_qty:g} {symbol} @ market | "
+            f"Submitted paper {order_plan.action} for {symbol} | "
             f"order id {order.id} | status {order.status}"
         )
+    elif dry_run:
+        log("Dry run enabled. No paper order submitted.")
 
-    else:
-        log("FLAT signal and no open position. No order.")
-
-    log(f"=== Run complete: signal={signal_label}, action={action} ===")
+    log(f"=== Run complete: signal={signal_label}, action={order_plan.action} ===")
 
     return ExecutionReport(
         symbol=symbol,
-        bar_timestamp=bar_timestamp,
-        close_price=close_price,
-        probability=probability,
+        bar_timestamp=order_plan.bar_timestamp,
+        close_price=order_plan.close_price,
+        probability=order_plan.probability,
         signal=signal_label,
-        action=action,
+        action=order_plan.action,
+        current_position=current_position,
         order_id=str(order.id) if order is not None else None,
         order_status=str(order.status.value if hasattr(order.status, "value") else order.status)
         if order is not None
         else None,
-        order_qty=order_qty,
+        order_qty=order_plan.quantity if order is not None else None,
         market_open=bool(clock.is_open),
+        dry_run=dry_run,
+        message=order_plan.reason,
         log_lines=log_lines,
     )

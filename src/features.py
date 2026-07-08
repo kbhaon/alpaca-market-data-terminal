@@ -69,6 +69,29 @@ class PCAFeatureResult:
     explained_variance_ratio: np.ndarray
     cumulative_explained_variance: np.ndarray
 
+    @property
+    def model_df(self) -> pd.DataFrame:
+        """Alias used by the workflow doc for the PCA-ready modeling frame."""
+        return self.data
+
+    @property
+    def component_columns(self) -> list[str]:
+        """Alias for PCA component column names."""
+        return self.pca_columns.copy()
+
+    @property
+    def pca_model(self) -> PCA:
+        """Alias for the fitted PCA transformer."""
+        return self.pca
+
+    @property
+    def train_rows(self) -> int:
+        return len(self.train_index)
+
+    @property
+    def test_rows(self) -> int:
+        return len(self.test_index)
+
 
 _REQUIRED_OHLCV_COLUMNS = ["open", "high", "low", "close", "volume"]
 
@@ -275,11 +298,16 @@ def build_feature_pca_pipeline(
         raise ValueError("variance_threshold must be in the range (0, 1].")
 
     result = df.copy()
-    available_features = get_feature_columns(result)
-    if feature_columns is None and len(available_features) < len(DEFAULT_FEATURE_COLUMNS):
+    selected_features = (
+        list(feature_columns) if feature_columns is not None else get_feature_columns(result)
+    )
+    missing_features = [column for column in selected_features if column not in result.columns]
+    if not selected_features or missing_features or target_col not in result.columns:
         result = build_ml_features(result, price_col=price_col, target_col=target_col)
+        selected_features = (
+            list(feature_columns) if feature_columns is not None else get_feature_columns(result)
+        )
 
-    selected_features = list(feature_columns) if feature_columns is not None else get_feature_columns(result)
     missing_features = [column for column in selected_features if column not in result.columns]
     if missing_features:
         raise ValueError(f"Missing selected feature columns: {missing_features}")
@@ -346,3 +374,65 @@ def build_feature_pca_pipeline(
         explained_variance_ratio=pca.explained_variance_ratio_,
         cumulative_explained_variance=np.cumsum(pca.explained_variance_ratio_),
     )
+
+
+def transform_features_with_pipeline(
+    df: pd.DataFrame,
+    pca_result: PCAFeatureResult,
+    feature_columns: Sequence[str] | None = None,
+    target_col: str = "target",
+    price_col: str = "close",
+) -> pd.DataFrame:
+    """
+    Transform new feature-complete rows with an already fitted scaler/PCA pipeline.
+
+    This does not refit the scaler or PCA object. It lets the app reuse the
+    cached model training result for later inference rows.
+    """
+
+    result = df.copy()
+    selected_features = (
+        list(feature_columns) if feature_columns is not None else pca_result.feature_columns
+    )
+
+    missing_features = [column for column in selected_features if column not in result.columns]
+    if missing_features or target_col not in result.columns:
+        result = build_ml_features(result, price_col=price_col, target_col=target_col)
+
+    missing_features = [column for column in selected_features if column not in result.columns]
+    if missing_features:
+        raise ValueError(f"Missing selected feature columns: {missing_features}")
+
+    result[selected_features] = result[selected_features].apply(pd.to_numeric, errors="coerce")
+    result = result.replace([np.inf, -np.inf], np.nan)
+    feature_ready = result.dropna(subset=selected_features).copy()
+    if feature_ready.empty:
+        raise ValueError("No feature-complete rows are available for PCA transformation.")
+
+    scaled = pca_result.scaler.transform(feature_ready[selected_features])
+    pca_values = pca_result.pca.transform(scaled)
+    if pca_values.shape[1] != len(pca_result.pca_columns):
+        raise ValueError("Transformed PCA output does not match the fitted component columns.")
+
+    for component_number, column in enumerate(pca_result.pca_columns):
+        feature_ready[column] = pca_values[:, component_number]
+
+    return feature_ready
+
+
+def transform_latest_features(
+    df: pd.DataFrame,
+    pca_result: PCAFeatureResult,
+    feature_columns: Sequence[str] | None = None,
+    target_col: str = "target",
+    price_col: str = "close",
+) -> pd.DataFrame:
+    """Return the latest row transformed by an already fitted scaler/PCA pipeline."""
+
+    return transform_features_with_pipeline(
+        df=df,
+        pca_result=pca_result,
+        feature_columns=feature_columns,
+        target_col=target_col,
+        price_col=price_col,
+    ).tail(1)
