@@ -93,11 +93,16 @@ def format_metric_value(metric: str, value: float) -> str:
 def build_metrics_table(
     results: list[Any],
     periods_per_year: float,
+    initial_capital: float = INITIAL_CAPITAL,
 ) -> pd.DataFrame:
     rows = []
 
     for result in results:
-        metrics = calculate_performance_metrics(result, periods_per_year)
+        metrics = calculate_performance_metrics(
+            result,
+            periods_per_year,
+            initial_capital=initial_capital,
+        )
         rows.append(
             {
                 "Strategy": result.name,

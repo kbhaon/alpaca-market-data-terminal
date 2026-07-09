@@ -16,11 +16,12 @@ STRATEGY_LINE_COLORS = {
     "Mean Reversion": "#C9823B",
     "Custom Multi-Factor": "#7A6FA8",
     "ML Signal": "#1B7F5C",
+    "ML Logistic Regression": "#1B7F5C",
 }
 
 
 def get_result_line_style(result_name: str) -> dict[str, Any] | None:
-    if result_name == BENCHMARK_NAME:
+    if result_name.startswith(BENCHMARK_NAME):
         return BENCHMARK_LINE
 
     color = STRATEGY_LINE_COLORS.get(result_name)

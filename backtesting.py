@@ -1,17 +1,31 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pandas as pd
 import streamlit as st
 from alpaca.data.timeframe import TimeFrameUnit
 
-from src.backtester import STRATEGY_SPECS, build_buy_hold_result, run_backtest
+from src.backtester import (
+    STRATEGY_SPECS,
+    build_buy_hold_result,
+    build_ml_strategy_spec,
+    run_backtest,
+)
 from src.company import get_company_name
 from src.company_search import CompanyMatch, get_company_choices
 from src.data_connector import get_historical_client
+from src.features import build_feature_pca_pipeline
 from src.historical import get_historical_bars
 from src.indicators import add_exponential_moving_average, add_required_indicators
-from src.metrics import build_metrics_table, infer_periods_per_year
-from src.plots import plot_drawdowns, plot_portfolio_values, plot_signal_chart
+from src.metrics import INITIAL_CAPITAL, build_metrics_table, infer_periods_per_year
+from src.models import PROBABILITY_THRESHOLD, run_ml_signal_pipeline
+from src.plots import (
+    plot_drawdowns,
+    plot_pca_explained_variance,
+    plot_portfolio_values,
+    plot_signal_chart,
+)
 
 
 st.set_page_config(page_title="Mini Trading Strategy Backtester", layout="wide")
@@ -39,6 +53,13 @@ INDICATOR_OPTIONS = [
     "Momentum 10",
     "Stochastic Oscillator",
 ]
+ML_STRATEGY_NAME = "ML Logistic Regression"
+ML_TEST_SIZE = 0.20
+ML_VARIANCE_THRESHOLD = 0.80
+ML_PERIODS_PER_YEAR = 252
+ML_SIGNAL_INDICATORS = ["MACD", "RSI 14", "Bollinger Bands"]
+BT_ML_BACKTEST_CACHE_STATE_KEY = "bt_ml_backtest_cache"
+STRATEGY_OPTIONS = [*STRATEGY_SPECS.keys(), ML_STRATEGY_NAME]
 
 
 def resolve_date_range(
@@ -173,6 +194,121 @@ def add_selected_indicators(df: pd.DataFrame, selected_indicators: list[str]) ->
     return result
 
 
+def get_daily_price_data_for_ml(
+    client,
+    symbol: str,
+    existing_price_df: pd.DataFrame,
+    timeframe_unit: TimeFrameUnit,
+    aggregate_factor: int,
+    range_start: pd.Timestamp,
+    range_end: pd.Timestamp,
+) -> pd.DataFrame:
+    if timeframe_unit == TimeFrameUnit.Day and aggregate_factor == 1:
+        return clean_price_data(existing_price_df)
+
+    daily_bars = get_historical_bars(
+        client=client,
+        symbol=symbol,
+        timeframe_value=1,
+        timeframe_unit=TimeFrameUnit.Day,
+        start=range_start.to_pydatetime(),
+        end=range_end.to_pydatetime(),
+    )
+    return clean_price_data(daily_bars)
+
+
+def get_ml_backtest_cache() -> dict:
+    return st.session_state.setdefault(BT_ML_BACKTEST_CACHE_STATE_KEY, {})
+
+
+def build_ml_backtest_cache_key(
+    requested_key: str,
+    probability_threshold: float,
+    test_size: float,
+    initial_capital: float,
+) -> str:
+    return (
+        f"{requested_key}|"
+        f"threshold={float(probability_threshold):.4f}|"
+        f"test_size={float(test_size):.4f}|"
+        f"capital={float(initial_capital):.2f}"
+    )
+
+
+def build_ml_logistic_regression_backtest(
+    daily_price_df: pd.DataFrame,
+    probability_threshold: float,
+    test_size: float,
+    initial_capital: float,
+) -> dict:
+    pca_result = build_feature_pca_pipeline(
+        daily_price_df,
+        price_col="close",
+        test_size=test_size,
+        variance_threshold=ML_VARIANCE_THRESHOLD,
+    )
+    ml_signal_result = run_ml_signal_pipeline(
+        pca_result,
+        probability_threshold=probability_threshold,
+        trade_on_test_only=True,
+    )
+    signal_df = ml_signal_result.signal_df
+    test_signal_df = signal_df[signal_df["ml_sample_type"].eq("test")].copy()
+
+    if len(test_signal_df) < 2:
+        raise ValueError("Not enough holdout test rows to run the ML backtest.")
+
+    ml_result = run_backtest(
+        test_signal_df,
+        build_ml_strategy_spec(),
+        initial_capital=initial_capital,
+    )
+    ml_result = replace(ml_result, name=ML_STRATEGY_NAME)
+    buy_hold_result = build_buy_hold_result(
+        test_signal_df,
+        initial_capital=initial_capital,
+    )
+    buy_hold_result = replace(buy_hold_result, name="Buy & Hold (ML Holdout)")
+
+    return {
+        "pca_result": pca_result,
+        "ml_signal_result": ml_signal_result,
+        "test_signal_df": test_signal_df,
+        "ml_result": ml_result,
+        "buy_hold_result": buy_hold_result,
+        "results": [buy_hold_result, ml_result],
+    }
+
+
+def retrain_ml_logistic_regression_backtest(
+    client,
+    symbol: str,
+    existing_price_df: pd.DataFrame,
+    timeframe_unit: TimeFrameUnit,
+    aggregate_factor: int,
+    range_start: pd.Timestamp,
+    range_end: pd.Timestamp,
+    probability_threshold: float,
+    test_size: float,
+    initial_capital: float,
+) -> dict:
+    daily_price_df = get_daily_price_data_for_ml(
+        client=client,
+        symbol=symbol,
+        existing_price_df=existing_price_df,
+        timeframe_unit=timeframe_unit,
+        aggregate_factor=aggregate_factor,
+        range_start=range_start,
+        range_end=range_end,
+    )
+    return build_ml_logistic_regression_backtest(
+        daily_price_df,
+        probability_threshold=probability_threshold,
+        test_size=test_size,
+        initial_capital=initial_capital,
+    )
+
+
 def safe_company_name(
     symbol: str,
     selected_match: CompanyMatch | None,
@@ -293,9 +429,37 @@ selected_indicators = st.sidebar.multiselect(
 
 selected_strategy_names = st.sidebar.multiselect(
     "Strategies",
-    options=list(STRATEGY_SPECS.keys()),
-    default=list(STRATEGY_SPECS.keys()),
+    options=STRATEGY_OPTIONS,
+    default=STRATEGY_OPTIONS,
 )
+include_ml_strategy = ML_STRATEGY_NAME in selected_strategy_names
+
+initial_capital = st.sidebar.slider(
+    "Initial capital",
+    min_value=10_000,
+    max_value=1_000_000,
+    value=int(INITIAL_CAPITAL),
+    step=10_000,
+)
+
+if include_ml_strategy:
+    ml_probability_threshold = st.sidebar.slider(
+        "ML probability threshold",
+        min_value=0.50,
+        max_value=0.90,
+        value=float(PROBABILITY_THRESHOLD),
+        step=0.01,
+    )
+    ml_test_size = st.sidebar.slider(
+        "ML test split proportion",
+        min_value=0.10,
+        max_value=0.50,
+        value=float(ML_TEST_SIZE),
+        step=0.05,
+    )
+else:
+    ml_probability_threshold = float(PROBABILITY_THRESHOLD)
+    ml_test_size = float(ML_TEST_SIZE)
 
 range_start, range_end = resolve_date_range(time_range, custom_days)
 
@@ -374,34 +538,140 @@ periods_per_year = infer_periods_per_year(
     aggregate_factor,
 )
 
-buy_hold_result = build_buy_hold_result(analysis_df)
+buy_hold_result = build_buy_hold_result(
+    analysis_df,
+    initial_capital=float(initial_capital),
+)
 strategy_results = []
+rule_strategy_names = [
+    strategy_name
+    for strategy_name in selected_strategy_names
+    if strategy_name != ML_STRATEGY_NAME
+]
 
-for strategy_name in selected_strategy_names:
+for strategy_name in rule_strategy_names:
     spec = STRATEGY_SPECS[strategy_name]
     signals = spec.signal_function(analysis_df.copy(), price_col="close")
-    strategy_results.append(run_backtest(signals, spec))
+    strategy_results.append(
+        run_backtest(
+            signals,
+            spec,
+            initial_capital=float(initial_capital),
+        )
+    )
 
-all_results = [buy_hold_result, *strategy_results]
+if strategy_results:
+    all_results = [buy_hold_result, *strategy_results]
 
-st.markdown(
-    '<div style="font-size: 24px; font-weight: 700; margin: 1.25rem 0 0.5rem;">'
-    "Buy/Sell Signals"
-    "</div>",
-    unsafe_allow_html=True,
-)
-signal_columns = st.columns(len(strategy_results))
+    st.markdown(
+        '<div style="font-size: 24px; font-weight: 700; margin: 1.25rem 0 0.5rem;">'
+        "Buy/Sell Signals"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    signal_columns = st.columns(len(strategy_results))
 
-for column, result in zip(signal_columns, strategy_results):
-    with column:
-        signal_fig = plot_signal_chart(result, selected_indicators, timeframe_unit)
-        st.plotly_chart(signal_fig, width="stretch")
+    for column, result in zip(signal_columns, strategy_results):
+        with column:
+            signal_fig = plot_signal_chart(result, selected_indicators, timeframe_unit)
+            st.plotly_chart(signal_fig, width="stretch")
 
-portfolio_fig = plot_portfolio_values(all_results, timeframe_unit)
-st.plotly_chart(portfolio_fig, width="stretch")
+    portfolio_fig = plot_portfolio_values(all_results, timeframe_unit)
+    st.plotly_chart(portfolio_fig, width="stretch")
 
-metrics_table = build_metrics_table(all_results, periods_per_year)
-st.dataframe(metrics_table, width="stretch")
+    metrics_table = build_metrics_table(
+        all_results,
+        periods_per_year,
+        initial_capital=float(initial_capital),
+    )
+    st.dataframe(metrics_table, width="stretch")
 
-drawdown_fig = plot_drawdowns(all_results, timeframe_unit)
-st.plotly_chart(drawdown_fig, width="stretch")
+    drawdown_fig = plot_drawdowns(all_results, timeframe_unit)
+    st.plotly_chart(drawdown_fig, width="stretch")
+
+if include_ml_strategy:
+    st.markdown(
+        '<div style="font-size: 24px; font-weight: 700; margin: 1.25rem 0 0.5rem;">'
+        "ML Logistic Regression Holdout Backtest"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"The model is trained on the first {1 - ml_test_size:.0%} of "
+        f"feature-ready daily bars and tested only on the last {ml_test_size:.0%} "
+        "chronological holdout."
+    )
+
+    ml_cache_key = build_ml_backtest_cache_key(
+        requested_key=requested_key,
+        probability_threshold=float(ml_probability_threshold),
+        test_size=float(ml_test_size),
+        initial_capital=float(initial_capital),
+    )
+    ml_backtest_cache = get_ml_backtest_cache()
+    retrain_ml_backtest = st.button(
+        "Retrain ML Logistic Regression",
+        key=f"bt_retrain_ml_{symbol}",
+    )
+    ml_backtest = None if retrain_ml_backtest else ml_backtest_cache.get(ml_cache_key)
+
+    if ml_backtest is None:
+        spinner_label = (
+            "Retraining logistic regression and evaluating the selected daily holdout..."
+            if retrain_ml_backtest
+            else "Training logistic regression and evaluating the selected daily holdout..."
+        )
+        with st.spinner(spinner_label):
+            try:
+                ml_backtest = retrain_ml_logistic_regression_backtest(
+                    client=client,
+                    symbol=symbol,
+                    existing_price_df=price_df,
+                    timeframe_unit=timeframe_unit,
+                    aggregate_factor=aggregate_factor,
+                    range_start=range_start,
+                    range_end=range_end,
+                    probability_threshold=float(ml_probability_threshold),
+                    test_size=float(ml_test_size),
+                    initial_capital=float(initial_capital),
+                )
+                ml_backtest_cache[ml_cache_key] = ml_backtest
+            except Exception as exc:
+                st.error(f"Could not run ML logistic regression backtest: {exc}")
+                st.stop()
+    else:
+        st.caption("Using cached ML backtest result for the selected settings.")
+
+    if retrain_ml_backtest:
+        st.success("Retrained ML logistic regression for the selected settings.")
+
+    ml_result = ml_backtest["ml_result"]
+    ml_results = ml_backtest["results"]
+
+    st.plotly_chart(
+        plot_signal_chart(ml_result, ML_SIGNAL_INDICATORS, TimeFrameUnit.Day),
+        width="stretch",
+    )
+    st.plotly_chart(
+        plot_pca_explained_variance(
+            ml_backtest["pca_result"].explained_variance_ratio,
+            threshold=ML_VARIANCE_THRESHOLD,
+        ),
+        width="stretch",
+    )
+    st.plotly_chart(
+        plot_portfolio_values(ml_results, TimeFrameUnit.Day),
+        width="stretch",
+    )
+
+    ml_metrics_table = build_metrics_table(
+        ml_results,
+        periods_per_year=ML_PERIODS_PER_YEAR,
+        initial_capital=float(initial_capital),
+    )
+    st.dataframe(ml_metrics_table, width="stretch")
+
+    st.plotly_chart(
+        plot_drawdowns(ml_results, TimeFrameUnit.Day),
+        width="stretch",
+    )

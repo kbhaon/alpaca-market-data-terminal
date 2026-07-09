@@ -3,6 +3,7 @@ from __future__ import annotations
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.live import StockDataStream
+from alpaca.trading.client import TradingClient
 
 from src.config import AlpacaSettings, get_settings
 
@@ -25,4 +26,13 @@ def get_stream_client(settings: AlpacaSettings | None = None) -> StockDataStream
         settings.api_key,
         settings.secret_key,
         feed=resolve_data_feed(settings.data_feed),
+    )
+
+
+def get_paper_trading_client(settings: AlpacaSettings | None = None) -> TradingClient:
+    settings = settings or get_settings()
+    return TradingClient(
+        settings.api_key,
+        settings.secret_key,
+        paper=True,
     )
