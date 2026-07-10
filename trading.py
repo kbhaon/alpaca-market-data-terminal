@@ -1,28 +1,47 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+import html
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
-from alpaca.data.timeframe import TimeFrameUnit
 
-from src.backtester import build_buy_hold_result, build_ml_strategy_spec, run_backtest
 from src.company import get_company_name
 from src.company_search import CompanyMatch, get_company_choices
-from src.data_connector import get_historical_client
-from src.execution import LOG_FILE, execute_latest_signal
-from src.features import build_feature_pca_pipeline, transform_latest_features
-from src.historical import fetch_daily_ohlcv, get_historical_bars
+from src.execution import (
+    account_details_dataframe,
+    account_portfolio_value,
+    build_account_cards,
+    build_strategy_cancel_error_report,
+    build_strategy_start_state,
+    build_strategy_stop_error_report,
+    fetch_current_strategy_state,
+    fetch_paper_account_snapshot,
+    fetch_portfolio_history_dataframe,
+    ML_STRATEGY_DISPLAY_NAME,
+    orders_to_dataframe,
+    orders_to_exchange_log_dataframe,
+    positions_to_dataframe,
+    reactivate_stopped_strategy,
+    read_paper_trading_log,
+    resolve_strategy_display_state,
+    stop_all_paper_positions,
+)
+from src.formatting import format_datetime
+from src.historical import (
+    RANGE_PRESETS,
+    fetch_historical_chart_bars,
+    resolve_date_range,
+    resolve_tick_spec,
+)
+from src.indicators import add_selected_indicators
 from src.live_quotes import get_live_quote_manager
-from src.metrics import build_metrics_table
-from src.models import PROBABILITY_THRESHOLD, run_ml_signal_pipeline, score_pca_features
 from src.plots import (
-    plot_drawdowns,
-    plot_pca_explained_variance,
-    plot_portfolio_values,
-    plot_signal_chart,
+    add_lower_indicator_window,
+    add_selected_indicator_traces,
+    prepare_historical_display_df,
+    selected_lower_indicator_windows,
 )
 
 
@@ -30,127 +49,86 @@ st.set_page_config(page_title="Alpaca Market Data Terminal", layout="wide")
 
 
 LIVE_QUOTE_REFRESH_SECONDS = 1.0
-EASTERN_TZ = "America/New_York"
-ML_HISTORY_YEARS = 5
-ML_PERIODS_PER_YEAR = 252
-ML_SIGNAL_INDICATORS = ["MACD", "RSI 14", "Bollinger Bands"]
-ML_MODEL_CACHE_STATE_KEY = "ml_model_cache"
-ML_EXECUTION_REPORTS_STATE_KEY = "ml_last_execution_reports"
-ML_LATEST_SIGNALS_STATE_KEY = "ml_latest_signal_frames"
+PAPER_ACCOUNT_REFRESH_SECONDS = 10.0
+PAPER_PORTFOLIO_TIMEFRAMES = ("1D", "1W", "1M", "3M", "YTD", "1Y", "ALL")
+PAPER_PORTFOLIO_TIMEFRAME_STATE_KEY = "paper_portfolio_timeframe"
+PAPER_PORTFOLIO_DEFAULT_TIMEFRAME = "1D"
+TRANSACTION_LOG_VISIBLE_ROWS = 5
+TRANSACTION_TABLE_ROW_HEIGHT = 32
+TRANSACTION_TABLE_HEIGHT = (TRANSACTION_LOG_VISIBLE_ROWS + 1) * TRANSACTION_TABLE_ROW_HEIGHT + 6
+LOCAL_LOG_HEIGHT = TRANSACTION_LOG_VISIBLE_ROWS * 22 + 24
+BULLISH_COLOR = "#1abc9c"
+BEARISH_COLOR = "#e74c3c"
+BULLISH_BAR_COLOR = "rgba(26, 188, 156, 0.45)"
+BEARISH_BAR_COLOR = "rgba(231, 76, 60, 0.45)"
+INDICATOR_OPTIONS = [
+    "SMA 50",
+    "SMA 200",
+    "EMA 12",
+    "EMA 26",
+    "EMA 20",
+    "MACD",
+    "RSI 14",
+    "Bollinger Bands",
+    "Momentum 10",
+    "Stochastic Oscillator",
+]
+STRATEGY_STOP_REPORT_STATE_KEY = "strategy_stop_report"
+STRATEGY_CANCEL_REPORT_STATE_KEY = "strategy_cancel_report"
+STRATEGY_START_FORM_STATE_KEY = "strategy_start_form_open"
+STRATEGY_ACTIVE_CONFIG_STATE_KEY = "strategy_active_config"
+STRATEGY_START_REPORT_STATE_KEY = "strategy_start_report"
+STRATEGY_START_OPTIONS = (
+    "Trend-following",
+    "Mean-reversion",
+    "Multi-factor",
+    ML_STRATEGY_DISPLAY_NAME,
+)
 
 
-RANGE_PRESETS = {
-    "1D": pd.DateOffset(days=1),
-    "5D": pd.DateOffset(days=5),
-    "1M": pd.DateOffset(months=1),
-    "3M": pd.DateOffset(months=3),
-    "6M": pd.DateOffset(months=6),
-    "1Y": pd.DateOffset(years=1),
-    "5Y": pd.DateOffset(years=5),
-}
-
-
-def resolve_date_range(
-    selected_range: str,
-    custom_days: int | None = None,
-    end: pd.Timestamp | None = None,
-) -> tuple[pd.Timestamp, pd.Timestamp]:
-    """Map a range button to an explicit calendar start/end range."""
-    resolved_end = (
-        pd.Timestamp(end)
-        if end is not None
-        else pd.Timestamp.now(tz="UTC").floor("min")
+def render_font_tokens() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --terminal-font-xs: 0.75rem;
+            --terminal-font-sm: 0.85rem;
+            --terminal-font-md: 1rem;
+            --terminal-font-lg: 1.2rem;
+            --terminal-font-xl: 1.5rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if resolved_end.tzinfo is None:
-        resolved_end = resolved_end.tz_localize("UTC")
-    else:
-        resolved_end = resolved_end.tz_convert("UTC")
 
-    if selected_range == "Custom":
-        offset = pd.DateOffset(days=int(custom_days or 30))
-    else:
-        offset = RANGE_PRESETS[selected_range]
-
-    return resolved_end - offset, resolved_end
-
-
-def resolve_tick_spec(
-    selected_tick: str,
-    custom_tick: int | None = None,
-) -> tuple[int, TimeFrameUnit, int]:
-    """Map a tick selector value to request timeframe and optional aggregate factor."""
-    if selected_tick == "Custom":
-        custom_tick_minutes = int(custom_tick or 1)
-
-        if custom_tick_minutes <= 59:
-            return custom_tick_minutes, TimeFrameUnit.Minute, 1
-
-        if custom_tick_minutes % 60 == 0:
-            return custom_tick_minutes // 60, TimeFrameUnit.Hour, 1
-
-        raise ValueError(
-            "Custom tick must be 1-59 minutes or a whole-hour minute value "
-            "(60, 120, 180, ...)."
-        )
-
-    if selected_tick.endswith("m"):
-        return int(selected_tick[:-1]), TimeFrameUnit.Minute, 1
-
-    if selected_tick in {"1D", "5D"}:
-        aggregate = 5 if selected_tick == "5D" else 1
-        return 1, TimeFrameUnit.Day, aggregate
-
-    if selected_tick in {"1M", "3M"}:
-        return int(selected_tick[:-1]), TimeFrameUnit.Month, 1
-
-    if selected_tick == "1h":
-        return 1, TimeFrameUnit.Hour, 1
-
-    return 1, TimeFrameUnit.Minute, 1
-
-
-def aggregate_bars_by_days(df: pd.DataFrame, days: int) -> pd.DataFrame:
-    """Aggregate daily bars into multi-day OHLCV bars."""
-    if days <= 1 or df.empty:
-        return df
-
-    resampled = (
-        df.set_index("timestamp")
-        .resample(f"{days}D", label="right")
-        .agg(
-            {
-                "open": "first",
-                "high": "max",
-                "low": "min",
-                "close": "last",
-                "volume": "sum",
-            }
-        )
+def render_sidebar_search_header() -> None:
+    st.sidebar.markdown(
+        """
+        <div style="
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            margin: 0.35rem 0 1rem;
+            color: #31333f;
+        ">
+            <svg width="25" height="25" viewBox="0 0 24 24" fill="none"
+                 xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" stroke="currentColor"
+                        stroke-width="2.25"/>
+                <path d="M16.2 16.2L21 21" stroke="currentColor"
+                      stroke-width="2.25" stroke-linecap="round"/>
+            </svg>
+            <span style="
+                font-size: var(--terminal-font-xl);
+                font-weight: 750;
+                line-height: 1.15;
+            ">Search</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-
-    return resampled.dropna(subset=["open", "high", "low", "close"]).reset_index()
-
-
-def prepare_historical_display_df(
-    df: pd.DataFrame,
-    timeframe_unit: TimeFrameUnit,
-) -> pd.DataFrame:
-    """Return a display copy with chart timestamps shown in Eastern time."""
-    if df.empty or "timestamp" not in df.columns:
-        return df
-
-    display_df = df.copy()
-    timestamps = pd.to_datetime(display_df["timestamp"], utc=True)
-
-    if timeframe_unit in {TimeFrameUnit.Minute, TimeFrameUnit.Hour}:
-        display_df["timestamp"] = (
-            timestamps.dt.tz_convert(EASTERN_TZ).dt.tz_localize(None)
-        )
-    else:
-        display_df["timestamp"] = timestamps.dt.date
-
-    return display_df
 
 
 def render_invalid_symbol_message(target=st) -> None:
@@ -167,7 +145,7 @@ def render_invalid_symbol_message(target=st) -> None:
             border-radius: 4px;
         ">
             <div>
-                <div style="font-size: 1.2rem; font-weight: 700;">
+                <div style="font-size: var(--terminal-font-lg); font-weight: 700;">
                     This symbol doesn't exist
                 </div>
                 <div style="margin-top: 0.5rem; color: #6b7280;">
@@ -200,346 +178,614 @@ def render_live_quote(symbol: str, is_valid_symbol: bool) -> None:
         st.error(f"Could not start live quote stream: {manager.error}")
         return
 
-    st.metric("Bid", snapshot.bid_display)
-    st.metric("Ask", snapshot.ask_display)
-    st.metric("Last", snapshot.last_trade_display)
+    quote_items = (
+        ("Bid", snapshot.bid_display),
+        ("Ask", snapshot.ask_display),
+        ("Last", snapshot.last_trade_display),
+    )
+    quote_html = "".join(
+        '<div class="equity-quote-item">'
+        f'<span class="equity-quote-label">{html.escape(str(label))}</span>'
+        f'<span class="equity-quote-value">{html.escape(str(value))}</span>'
+        "</div>"
+        for label, value in quote_items
+    )
+
     if snapshot.updated_at is None:
-        st.caption("Waiting for first streamed update.")
+        updated_text = "Waiting for first streamed update."
     else:
-        st.caption(f"Updated at: {snapshot.updated_at_display}")
+        updated_text = f"Updated at: {snapshot.updated_at_display}"
 
-
-def _latest_ml_signal_row(signal_df: pd.DataFrame) -> pd.Series | None:
-    if signal_df.empty or "ml_probability" not in signal_df.columns:
-        return None
-
-    ready = signal_df.dropna(subset=["ml_probability"])
-    if ready.empty:
-        return None
-
-    return ready.iloc[-1]
-
-
-def _get_ml_model_cache() -> dict:
-    return st.session_state.setdefault(ML_MODEL_CACHE_STATE_KEY, {})
-
-
-def _get_ml_execution_reports() -> dict:
-    return st.session_state.setdefault(ML_EXECUTION_REPORTS_STATE_KEY, {})
-
-
-def _get_ml_latest_signal_frames() -> dict:
-    return st.session_state.setdefault(ML_LATEST_SIGNALS_STATE_KEY, {})
-
-
-def _read_paper_trading_log(max_lines: int = 80) -> str:
-    if not LOG_FILE.exists():
-        return "No paper-trading log has been written yet."
-
-    lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-    recent_lines = lines[-max_lines:]
-    return "\n".join(recent_lines) if recent_lines else "No paper-trading log entries yet."
-
-
-def _build_ml_results(
-    symbol: str,
-    years: int,
-    probability_threshold: float,
-    test_size: float,
-) -> dict:
-    price_df = fetch_daily_ohlcv(symbol, years=years)
-    if price_df.empty:
-        raise ValueError(f"No daily OHLCV bars returned for {symbol}.")
-
-    pca_result = build_feature_pca_pipeline(
-        price_df,
-        price_col="close",
-        test_size=test_size,
-    )
-    ml_signal_result = run_ml_signal_pipeline(
-        pca_result,
-        probability_threshold=probability_threshold,
-        trade_on_test_only=True,
-    )
-    signal_df = ml_signal_result.signal_df
-
-    test_signal_df = signal_df[signal_df["ml_sample_type"].eq("test")].copy()
-    if len(test_signal_df) < 2:
-        test_signal_df = signal_df.dropna(subset=["ml_probability"]).copy()
-
-    if len(test_signal_df) < 2:
-        raise ValueError("Not enough ML signal rows to run the backtest.")
-
-    ml_spec = build_ml_strategy_spec()
-    ml_result = run_backtest(test_signal_df, ml_spec)
-    buy_hold_result = build_buy_hold_result(test_signal_df)
-    results = [buy_hold_result, ml_result]
-
-    return {
-        "price_df": price_df,
-        "pca_result": pca_result,
-        "ml_signal_result": ml_signal_result,
-        "signal_df": signal_df,
-        "backtest_df": test_signal_df,
-        "ml_result": ml_result,
-        "buy_hold_result": buy_hold_result,
-        "results": results,
-        "metrics_table": build_metrics_table(
-            results,
-            periods_per_year=ML_PERIODS_PER_YEAR,
-        ),
-        "trained_at": pd.Timestamp.now(tz="UTC"),
-    }
-
-
-def _train_ml_panel_state(
-    symbol: str,
-    years: int,
-    probability_threshold: float,
-    test_size: float,
-) -> dict:
-    return {
-        "symbol": symbol,
-        "years": years,
-        "probability_threshold": probability_threshold,
-        "test_size": test_size,
-        **_build_ml_results(
-            symbol=symbol,
-            years=years,
-            probability_threshold=probability_threshold,
-            test_size=test_size,
-        ),
-    }
-
-
-def _build_fresh_latest_signal(
-    symbol: str,
-    panel_state: dict,
-) -> pd.DataFrame:
-    fresh_price_df = fetch_daily_ohlcv(symbol, years=int(panel_state["years"]))
-    if fresh_price_df.empty:
-        raise ValueError(f"No latest daily OHLCV bars returned for {symbol}.")
-
-    latest_pca_df = transform_latest_features(
-        fresh_price_df,
-        panel_state["pca_result"],
-        price_col="close",
-    )
-    ml_signal_result = panel_state["ml_signal_result"]
-    return score_pca_features(
-        pca_frame=latest_pca_df,
-        component_columns=ml_signal_result.component_columns,
-        model=ml_signal_result.model,
-        probability_threshold=ml_signal_result.probability_threshold,
+    st.markdown(
+        """
+        <style>
+        .equity-quote-row {
+            display: flex;
+            align-items: baseline;
+            gap: 1.2rem;
+            flex-wrap: wrap;
+            margin: -0.2rem 0 0.8rem;
+        }
+        .equity-quote-item {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 0.32rem;
+            min-width: 5.2rem;
+        }
+        .equity-quote-label {
+            color: #6b7280;
+            font-size: var(--terminal-font-sm);
+            font-weight: 600;
+        }
+        .equity-quote-value {
+            color: #31333f;
+            font-size: var(--terminal-font-lg);
+            font-weight: 650;
+            line-height: 1.2;
+        }
+        .equity-quote-updated {
+            color: #6b7280;
+            font-size: var(--terminal-font-xs);
+            margin: -0.35rem 0 0.9rem;
+        }
+        </style>
+        """
+        f'<div class="equity-quote-row">{quote_html}</div>'
+        f'<div class="equity-quote-updated">{html.escape(str(updated_text))}</div>',
+        unsafe_allow_html=True,
     )
 
 
-def _execution_report_dict(report) -> dict:
-    report_dict = asdict(report)
-    report_dict["bar_timestamp"] = str(report_dict["bar_timestamp"])
-    return report_dict
+def _paper_account_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .paper-account-shell {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 0.55rem;
+            margin: 0.25rem 0 0.65rem;
+        }
+        .paper-card-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 0.5rem;
+        }
+        .paper-card {
+            background: #f9fafb;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 0.55rem 0.65rem;
+            min-height: 62px;
+        }
+        .paper-card-label {
+            color: #6b7280;
+            font-size: var(--terminal-font-sm);
+            font-weight: 650;
+            line-height: 1.2;
+            margin-bottom: 0.22rem;
+        }
+        .paper-card-value {
+            color: #111827;
+            font-size: var(--terminal-font-md);
+            font-weight: 750;
+            line-height: 1.18;
+            overflow-wrap: anywhere;
+        }
+        .paper-card-value.positive {
+            color: #1abc9c;
+        }
+        .paper-card-value.negative {
+            color: #e74c3c;
+        }
+        .paper-card-note {
+            color: #6b7280;
+            font-size: var(--terminal-font-xs);
+            margin-top: 0.25rem;
+            line-height: 1.25;
+            overflow-wrap: anywhere;
+        }
+        @media (max-width: 720px) {
+            .paper-card-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-def render_ml_trading_panel(symbol: str, is_valid_symbol: bool) -> None:
-    st.subheader("ML Trading Signal")
+def _render_metric_cards(cards: list[dict[str, str]]) -> None:
+    card_html = []
+    display_cards = [card for card in cards if card.get("label") != "Recent Order"]
+    for card in display_cards:
+        value_class = html.escape(card.get("class", "neutral"))
+        card_html.append(
+            '<div class="paper-card">'
+            f'<div class="paper-card-label">{html.escape(card["label"])}</div>'
+            f'<div class="paper-card-value {value_class}">{html.escape(card["value"])}</div>'
+            f'<div class="paper-card-note">{html.escape(card["note"])}</div>'
+            "</div>"
+        )
 
-    if not is_valid_symbol:
-        st.info("Choose a valid ticker before training the ML signal.")
+    st.markdown(
+        '<div class="paper-account-shell">'
+        '<div class="paper-card-grid">'
+        f'{"".join(card_html)}'
+        "</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_strategy_status(
+    strategy: str,
+    equity: str,
+    status: str,
+) -> None:
+    items = [
+        ("Strategy", strategy, "strategy"),
+        ("Equity", equity, "equity"),
+        ("Status", status, "status"),
+    ]
+    item_html = "".join(
+        '<div class="strategy-status-item">'
+        f'<div class="strategy-status-label">{html.escape(label)}</div>'
+        f'<div class="strategy-status-value {css_class}">{html.escape(value)}</div>'
+        "</div>"
+        for label, value, css_class in items
+    )
+    st.markdown(
+        """
+        <style>
+        .strategy-status-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1.35fr) minmax(0, 0.75fr) minmax(0, 0.9fr);
+            gap: 0.85rem;
+            margin: 0.4rem 0 1rem;
+        }
+        .strategy-status-label {
+            color: #31333f;
+            font-size: var(--terminal-font-sm);
+            font-weight: 600;
+            line-height: 1.2;
+            margin-bottom: 0.35rem;
+        }
+        .strategy-status-value {
+            color: #31333f;
+            font-size: var(--terminal-font-lg);
+            font-weight: 500;
+            line-height: 1.15;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .strategy-status-value.equity,
+        .strategy-status-value.status {
+            font-size: var(--terminal-font-lg);
+        }
+        </style>
+        """
+        f'<div class="strategy-status-grid">{item_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _strategy_start_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stForm"] button[kind="primary"] {
+            background: #1abc9c;
+            border-color: #1abc9c;
+            color: #ffffff;
+        }
+        div[data-testid="stForm"] button[kind="primary"]:hover {
+            background: #159a80;
+            border-color: #159a80;
+            color: #ffffff;
+        }
+        div[data-testid="stForm"] button[kind="primary"]:focus {
+            box-shadow: 0 0 0 0.2rem rgba(26, 188, 156, 0.25);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_start_trading_controls(
+    start_equity_options: list[str],
+    equity_by_label: dict[str, CompanyMatch],
+) -> None:
+    _strategy_start_styles()
+    has_equity_options = len(start_equity_options) > 1
+
+    with st.form("strategy_start_launcher_form"):
+        start_form_requested = st.form_submit_button(
+            "Start Trading",
+            type="primary",
+            width="stretch",
+            disabled=not has_equity_options,
+        )
+
+    if not has_equity_options:
+        st.caption("No equity universe is available for strategy startup.")
+
+    if start_form_requested:
+        st.session_state[STRATEGY_START_FORM_STATE_KEY] = True
+
+    if not st.session_state.get(STRATEGY_START_FORM_STATE_KEY, False):
         return
 
-    model_cache = _get_ml_model_cache()
-    panel_state = model_cache.get(symbol)
-
-    cached_threshold = (
-        float(panel_state.get("probability_threshold", PROBABILITY_THRESHOLD))
-        if panel_state is not None
-        else float(PROBABILITY_THRESHOLD)
-    )
-    cached_test_size = (
-        float(panel_state.get("test_size", 0.20))
-        if panel_state is not None
-        else 0.20
-    )
-
-    control_cols = st.columns([1, 1, 1])
-    with control_cols[0]:
-        probability_threshold = st.slider(
-            "Long probability threshold",
-            min_value=0.50,
-            max_value=0.90,
-            value=cached_threshold,
-            step=0.01,
-            key=f"ml_threshold_{symbol}",
+    with st.form("strategy_start_form"):
+        selected_equity_label = st.selectbox(
+            "Equity",
+            options=start_equity_options,
+            key="strategy_start_equity_selection",
         )
-    with control_cols[1]:
-        test_size = st.slider(
-            "Backtest holdout",
-            min_value=0.10,
-            max_value=0.50,
-            value=cached_test_size,
-            step=0.05,
-            key=f"ml_holdout_{symbol}",
+        selected_strategy = st.selectbox(
+            "Strategy",
+            options=STRATEGY_START_OPTIONS,
+            key="strategy_start_selection",
         )
-    with control_cols[2]:
-        order_notional = st.number_input(
-            "Paper order notional",
-            min_value=100.0,
-            max_value=1_000_000.0,
-            value=100_000.0,
-            step=10_000.0,
-            key=f"ml_order_notional_{symbol}",
+        start_submitted = st.form_submit_button(
+            "Start",
+            type="primary",
+            width="stretch",
+        )
+        st.warning(
+            "Before proceeding, test this strategy in the Backtesting module "
+            "for the selected equity and review its risk and performance."
         )
 
-    years = ML_HISTORY_YEARS
-    train_button_label = (
-        "Train Model / Run Backtest"
-        if panel_state is None
-        else "Retrain Model / Run Backtest"
-    )
-
-    if panel_state is None:
-        st.info("Train once for this equity. Later paper orders reuse the cached model and refresh only the latest signal.")
-    elif (
-        abs(float(probability_threshold) - cached_threshold) > 1e-9
-        or abs(float(test_size) - cached_test_size) > 1e-9
-    ):
-        st.info("The changed model controls will apply after retraining.")
-
-    if st.button(train_button_label, key=f"ml_retrain_{symbol}"):
-        with st.spinner("Fetching 5 years of daily bars, fitting PCA, and training ML model..."):
-            try:
-                model_cache[symbol] = _train_ml_panel_state(
-                    symbol=symbol,
-                    years=years,
-                    probability_threshold=probability_threshold,
-                    test_size=test_size,
-                )
-                panel_state = model_cache[symbol]
-                _get_ml_latest_signal_frames().pop(symbol, None)
-                _get_ml_execution_reports().pop(symbol, None)
-                st.success("Model trained for this equity.")
-            except Exception as exc:
-                st.error(f"Could not train ML signal: {exc}")
-                return
-
-    if panel_state is None:
+    if not start_submitted:
         return
 
-    trained_at = panel_state.get("trained_at")
-    trained_at_display = str(trained_at) if trained_at is not None else "current session"
+    selected_equity = equity_by_label.get(selected_equity_label)
+    if selected_equity is None:
+        st.warning("Select an equity before starting a trading strategy.")
+        return
+
+    symbol = selected_equity.symbol
+    active_config, start_report = build_strategy_start_state(selected_strategy, symbol)
+    st.session_state[STRATEGY_ACTIVE_CONFIG_STATE_KEY] = active_config
+    st.session_state[STRATEGY_START_REPORT_STATE_KEY] = start_report
+    st.session_state[STRATEGY_START_FORM_STATE_KEY] = False
+    st.session_state.pop(STRATEGY_STOP_REPORT_STATE_KEY, None)
+    st.session_state.pop(STRATEGY_CANCEL_REPORT_STATE_KEY, None)
+    st.rerun()
+
+
+def _render_portfolio_history_chart(history_df: pd.DataFrame) -> None:
+    if history_df.empty or len(history_df) < 2:
+        st.info("No portfolio history returned by Alpaca for this time frame.")
+        return
+
+    first_equity = float(history_df["equity"].iloc[0])
+    last_equity = float(history_df["equity"].iloc[-1])
+    portfolio_change = last_equity - first_equity
+    line_color = BULLISH_COLOR if portfolio_change >= 0 else BEARISH_COLOR
+    min_equity = float(history_df["equity"].min())
+    max_equity = float(history_df["equity"].max())
+    padding = max((max_equity - min_equity) * 0.12, abs(last_equity) * 0.005, 1.0)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=history_df["timestamp"],
+            y=history_df["equity"],
+            mode="lines",
+            line={"color": line_color, "width": 2.4},
+            hovertemplate="%{x|%b %d, %Y %H:%M}<br>%{y:$,.2f}<extra></extra>",
+        )
+    )
+    fig.add_hline(
+        y=first_equity,
+        line_dash="dot",
+        line_color="#9ca3af",
+        line_width=1.4,
+        opacity=0.85,
+    )
+    fig.update_layout(
+        height=290,
+        margin={"l": 56, "r": 12, "t": 8, "b": 48},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        hovermode="x unified",
+        font={"color": "#374151", "size": 11},
+    )
+    fig.update_xaxes(
+        title_text="Time / Date",
+        showgrid=True,
+        gridcolor="#eef2f7",
+        zeroline=False,
+        showline=True,
+        linecolor="#d1d5db",
+        showticklabels=True,
+        ticks="outside",
+        tickfont={"size": 10},
+        title_font={"size": 11},
+    )
+    fig.update_yaxes(
+        title_text="Value",
+        showgrid=True,
+        gridcolor="#eef2f7",
+        zeroline=False,
+        showline=True,
+        linecolor="#d1d5db",
+        showticklabels=True,
+        tickprefix="$",
+        tickformat=",.0f",
+        tickfont={"size": 10},
+        title_font={"size": 11},
+        range=[min_equity - padding, max_equity + padding],
+    )
+
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        config={"displayModeBar": False},
+    )
+
+
+def _render_portfolio_history_panel() -> None:
+    if PAPER_PORTFOLIO_TIMEFRAME_STATE_KEY not in st.session_state:
+        st.session_state[PAPER_PORTFOLIO_TIMEFRAME_STATE_KEY] = PAPER_PORTFOLIO_DEFAULT_TIMEFRAME
+
+    selected_timeframe = st.session_state[PAPER_PORTFOLIO_TIMEFRAME_STATE_KEY]
+    try:
+        history_df = fetch_portfolio_history_dataframe(selected_timeframe)
+    except Exception as exc:
+        st.warning(f"Could not load Alpaca portfolio history: {exc}")
+        history_df = pd.DataFrame()
+
+    _render_portfolio_history_chart(history_df)
+    st.segmented_control(
+        "Portfolio chart time frame",
+        options=PAPER_PORTFOLIO_TIMEFRAMES,
+        key=PAPER_PORTFOLIO_TIMEFRAME_STATE_KEY,
+        label_visibility="collapsed",
+        width="stretch",
+    )
+
+
+@st.fragment(run_every=PAPER_ACCOUNT_REFRESH_SECONDS)
+def render_paper_account_panel() -> None:
+    _paper_account_styles()
+
+    title_col, action_col = st.columns([0.9, 0.1], vertical_alignment="center")
+    with title_col:
+        st.subheader("Paper Account")
+    with action_col:
+        st.button(
+            "⟳",
+            key="paper_account_refresh",
+            help="Refresh account",
+            width="stretch",
+        )
+
+    try:
+        snapshot = fetch_paper_account_snapshot()
+    except Exception as exc:
+        st.warning(f"Could not load Alpaca paper account: {exc}")
+        return
+
+    account = snapshot["account"]
+    positions = snapshot["positions"]
+    orders = snapshot["orders"]
+    portfolio_value = account_portfolio_value(account)
+
+    _render_metric_cards(
+        build_account_cards(
+            account=account,
+            positions=positions,
+            orders=orders,
+        )
+    )
+
     st.caption(
-        "Using cached model for "
-        f"{symbol} trained at {trained_at_display}. "
-        "Paper orders refresh latest data without retraining."
+        "Account data refreshes every "
+        f"{PAPER_ACCOUNT_REFRESH_SECONDS:.0f}s. Last refresh: "
+        f"{format_datetime(snapshot['fetched_at'])}."
+    )
+    _render_portfolio_history_panel()
+
+    tab_overview, tab_holdings, tab_transactions = st.tabs(
+        ["Overview", "Holdings", "Transactions"]
     )
 
-    signal_df = panel_state["signal_df"]
-    latest = _latest_ml_signal_row(signal_df)
-    if latest is None:
-        st.warning("The ML pipeline did not produce a latest signal row.")
+    with tab_overview:
+        st.markdown("**Account Details**")
+        st.dataframe(
+            account_details_dataframe(account, positions, orders),
+            hide_index=True,
+            width="stretch",
+        )
+
+    with tab_holdings:
+        holdings_df = positions_to_dataframe(positions, portfolio_value)
+        if holdings_df.empty:
+            st.info("No open paper positions.")
+        else:
+            st.dataframe(holdings_df, hide_index=True, width="stretch")
+
+    with tab_transactions:
+        order_history_df = orders_to_dataframe(orders)
+        exchange_log_df = orders_to_exchange_log_dataframe(orders)
+
+        st.markdown("**Order History**")
+        if order_history_df.empty:
+            st.info("No recent paper orders returned by Alpaca.")
+        else:
+            st.dataframe(
+                order_history_df,
+                hide_index=True,
+                width="stretch",
+                height=TRANSACTION_TABLE_HEIGHT,
+                row_height=TRANSACTION_TABLE_ROW_HEIGHT,
+            )
+
+        st.markdown("**Alpaca Order Event Log**")
+        if exchange_log_df.empty:
+            st.info("No exchange order events returned by Alpaca.")
+        else:
+            st.dataframe(
+                exchange_log_df,
+                hide_index=True,
+                width="stretch",
+                height=TRANSACTION_TABLE_HEIGHT,
+                row_height=TRANSACTION_TABLE_ROW_HEIGHT,
+            )
+
+        st.markdown("**Local Execution Log**")
+        st.code(
+            read_paper_trading_log(max_lines=160),
+            language="text",
+            height=LOCAL_LOG_HEIGHT,
+        )
+
+
+def render_strategy_management_panel(
+    start_equity_options: list[str],
+    equity_by_label: dict[str, CompanyMatch],
+) -> None:
+    st.subheader("Trading Strategy Management")
+
+    try:
+        strategy_state = fetch_current_strategy_state()
+    except Exception as exc:
+        strategy_state = {
+            "equity": "n/a",
+            "status": "Unavailable",
+            "has_position": False,
+            "error": str(exc),
+        }
+
+    active_config = st.session_state.get(STRATEGY_ACTIVE_CONFIG_STATE_KEY)
+    report = st.session_state.get(STRATEGY_STOP_REPORT_STATE_KEY)
+    display_state = resolve_strategy_display_state(
+        strategy_state,
+        active_config,
+        report,
+    )
+
+    _render_strategy_status(
+        display_state["display_strategy"],
+        display_state["display_equity"],
+        display_state["display_status"],
+    )
+
+    if strategy_state["has_position"]:
+        stop_col, info_col = st.columns([0.22, 0.78], vertical_alignment="center")
+        with stop_col:
+            stop_clicked = st.button(
+                "STOP",
+                key=f"strategy_stop_all_{strategy_state['equity']}",
+                type="primary",
+                width="stretch",
+            )
+        with info_col:
+            st.caption("STOP cancels open paper orders and submits closing orders for all open paper positions.")
+    else:
+        stop_clicked = False
+
+    if strategy_state.get("error"):
+        st.warning(f"Could not load current paper holding: {strategy_state['error']}")
+
+    if (
+        not strategy_state["has_position"]
+        and not display_state["has_pending_stop_report"]
+        and active_config is None
+    ):
+        _render_start_trading_controls(start_equity_options, equity_by_label)
+
+    start_report = st.session_state.get(STRATEGY_START_REPORT_STATE_KEY)
+    if display_state["started_without_position"] and start_report is not None:
+        started_at = start_report.get("started_at")
+        started_text = format_datetime(started_at) if started_at is not None else "n/a"
+        st.success(f"{start_report.get('message', '')} Started at: {started_text}.")
+
+    if stop_clicked:
+        with st.spinner("Submitting close-all request to Alpaca paper trading..."):
+            try:
+                st.session_state[STRATEGY_STOP_REPORT_STATE_KEY] = stop_all_paper_positions()
+                st.session_state.pop(STRATEGY_CANCEL_REPORT_STATE_KEY, None)
+                st.session_state.pop(STRATEGY_START_REPORT_STATE_KEY, None)
+            except Exception as exc:
+                st.session_state[STRATEGY_STOP_REPORT_STATE_KEY] = (
+                    build_strategy_stop_error_report(exc)
+                )
+
+    report = st.session_state.get(STRATEGY_STOP_REPORT_STATE_KEY)
+    if report is None:
         return
 
-    summary_cols = st.columns(4)
-    summary_cols[0].metric("Cached Signal", str(latest["ml_signal"]))
-    summary_cols[1].metric("P(next day up)", f"{float(latest['ml_probability']):.2%}")
-    summary_cols[2].metric("Training Rows", int(signal_df["ml_sample_type"].eq("train").sum()))
-    summary_cols[3].metric("Backtest Rows", int(signal_df["ml_sample_type"].eq("test").sum()))
+    stopped_at = report.get("stopped_at")
+    timestamp_text = format_datetime(stopped_at) if stopped_at is not None else "n/a"
+    message = f"{report.get('message', '')} Last STOP action: {timestamp_text}."
 
-    tab_metrics, tab_charts, tab_trades, tab_paper = st.tabs(
-        ["Metrics", "Charts", "Trades", "Paper Order"]
+    if report.get("error"):
+        st.error(message)
+    else:
+        st.success(message)
+
+    orders = report.get("orders") or []
+    if orders:
+        st.dataframe(pd.DataFrame(orders), hide_index=True, width="stretch")
+
+    stopped_positions = report.get("stopped_positions") or []
+    source_stopped_at = str(report.get("stopped_at"))
+    cancel_report = st.session_state.get(STRATEGY_CANCEL_REPORT_STATE_KEY)
+    cancel_matches_report = (
+        cancel_report is not None
+        and cancel_report.get("source_stopped_at") == source_stopped_at
     )
 
-    with tab_metrics:
-        st.dataframe(panel_state["metrics_table"], width="stretch")
-        st.dataframe(
-            signal_df[
-                [
-                    "timestamp",
-                    "close",
-                    "ml_sample_type",
-                    "ml_probability",
-                    "ml_signal",
-                    "ml_position",
-                    "ml_trade_signal",
-                ]
-            ].tail(20),
-            width="stretch",
-        )
-
-    with tab_charts:
-        variance = signal_df.attrs.get("ml_pca_explained_variance_ratio", [])
-        if variance:
-            st.plotly_chart(
-                plot_pca_explained_variance(variance, threshold=0.80),
+    if stopped_positions and not report.get("error") and not cancel_matches_report:
+        cancel_col, cancel_info_col = st.columns([0.22, 0.78], vertical_alignment="center")
+        with cancel_col:
+            cancel_clicked = st.button(
+                "Cancel STOP",
+                key=f"strategy_cancel_stop_{source_stopped_at}",
                 width="stretch",
             )
-        st.plotly_chart(
-            plot_signal_chart(
-                panel_state["ml_result"],
-                ML_SIGNAL_INDICATORS,
-                TimeFrameUnit.Day,
-            ),
-            width="stretch",
-        )
-        st.plotly_chart(
-            plot_portfolio_values(panel_state["results"], TimeFrameUnit.Day),
-            width="stretch",
-        )
-        st.plotly_chart(
-            plot_drawdowns(panel_state["results"], TimeFrameUnit.Day),
-            width="stretch",
-        )
+        with cancel_info_col:
+            st.caption("Cancel reactivates the strategy by buying back the stopped position.")
 
-    with tab_trades:
-        trades = panel_state["ml_result"].trades
-        if trades.empty:
-            st.info("No closed ML trades in the current backtest window.")
-        else:
-            st.dataframe(trades, width="stretch")
-
-    with tab_paper:
-        st.caption("Orders submitted here use Alpaca paper trading credentials only.")
-        if st.button("Refresh Signal and Submit Paper Order", key=f"ml_submit_{symbol}"):
-            with st.spinner("Fetching latest bars, scoring the cached model, and submitting a paper order..."):
+        if cancel_clicked:
+            with st.spinner("Reactivating strategy in Alpaca paper trading..."):
                 try:
-                    latest_signal_df = _build_fresh_latest_signal(symbol, panel_state)
-                    _get_ml_latest_signal_frames()[symbol] = latest_signal_df
-                    report = execute_latest_signal(
-                        symbol,
-                        signal_df=latest_signal_df,
-                        notional=float(order_notional),
-                    )
-                    _get_ml_execution_reports()[symbol] = report
+                    st.session_state[STRATEGY_CANCEL_REPORT_STATE_KEY] = reactivate_stopped_strategy(report)
                 except Exception as exc:
-                    st.error(f"Could not submit paper-trading action: {exc}")
+                    st.session_state[STRATEGY_CANCEL_REPORT_STATE_KEY] = (
+                        build_strategy_cancel_error_report(exc, source_stopped_at)
+                    )
+            cancel_report = st.session_state.get(STRATEGY_CANCEL_REPORT_STATE_KEY)
+            cancel_matches_report = True
 
-        latest_signal_df = _get_ml_latest_signal_frames().get(symbol)
-        if latest_signal_df is not None:
-            st.dataframe(
-                latest_signal_df[
-                    [
-                        "timestamp",
-                        "close",
-                        "ml_probability",
-                        "ml_signal",
-                        "ml_position",
-                        "ml_trade_signal",
-                    ]
-                ],
-                width="stretch",
-            )
+    if cancel_matches_report:
+        reactivated_at = cancel_report.get("reactivated_at")
+        reactivated_text = (
+            format_datetime(reactivated_at)
+            if reactivated_at is not None
+            else "n/a"
+        )
+        cancel_message = (
+            f"{cancel_report.get('message', '')} "
+            f"Last reactivation action: {reactivated_text}."
+        )
+        if cancel_report.get("error"):
+            st.error(cancel_message)
+        else:
+            st.success(cancel_message)
 
-        report = _get_ml_execution_reports().get(symbol)
-        if report is not None:
-            st.json(_execution_report_dict(report))
-            if report.log_lines:
-                st.markdown("Latest execution log")
-                st.code("\n".join(report.log_lines), language="text")
-
-        st.markdown("Recent paper-trading log")
-        st.code(_read_paper_trading_log(), language="text")
-
-st.title("Mini Market Data Terminal v1.0")
+        cancel_orders = cancel_report.get("orders") or []
+        if cancel_orders:
+            st.dataframe(pd.DataFrame(cancel_orders), hide_index=True, width="stretch")
 
 
 if "ticker_input" not in st.session_state:
@@ -584,7 +830,8 @@ if current_match is not None:
 else:
     st.session_state.equity_selection = equity_placeholder
 
-
+render_font_tokens()
+render_sidebar_search_header()
 st.sidebar.selectbox(
     "Stocks & ETFs",
     options=equity_options,
@@ -645,6 +892,13 @@ else:
     custom_tick = None
 
 
+selected_indicators = st.sidebar.multiselect(
+    "Indicators",
+    options=INDICATOR_OPTIONS,
+    default=[],
+)
+
+
 range_start, range_end = resolve_date_range(time_range, custom_days)
 
 try:
@@ -657,17 +911,10 @@ except ValueError as exc:
     st.stop()
 
 
-try:
-    client = get_historical_client()
-except ValueError as exc:
-    st.error(str(exc))
-    st.stop()
+equity_panel, trading_panel = st.columns([1.35, 1], gap="large")
 
 
-left, right = st.columns([2, 1])
-
-
-with left:
+with equity_panel:
     if not is_valid_symbol:
         company_name = symbol or "Invalid symbol"
     elif selected_match is not None and selected_match.symbol == symbol:
@@ -676,6 +923,7 @@ with left:
         company_name = get_company_name(symbol)
 
     st.subheader(f"{company_name} ({symbol})")
+    render_live_quote(symbol, is_valid_symbol)
 
     chart_area = st.empty()
     table_area = st.empty()
@@ -697,23 +945,19 @@ with left:
 
         if not has_data:
             with st.spinner("Loading historical bars..."):
-                request_value = timeframe_value
-                request_unit = timeframe_unit
-
-                if timeframe_unit == TimeFrameUnit.Day and aggregate_factor > 1:
-                    request_value = 1
-
-                bars = get_historical_bars(
-                    client=client,
-                    symbol=symbol,
-                    timeframe_value=request_value,
-                    timeframe_unit=request_unit,
-                    start=range_start.to_pydatetime(),
-                    end=range_end.to_pydatetime(),
-                )
-
-                if timeframe_unit == TimeFrameUnit.Day and aggregate_factor > 1:
-                    bars = aggregate_bars_by_days(bars, aggregate_factor)
+                try:
+                    bars = fetch_historical_chart_bars(
+                        symbol=symbol,
+                        start=range_start,
+                        end=range_end,
+                        timeframe_value=timeframe_value,
+                        timeframe_unit=timeframe_unit,
+                        aggregate_factor=aggregate_factor,
+                    )
+                except ValueError as exc:
+                    chart_area.error(str(exc))
+                    table_area.markdown("")
+                    st.stop()
 
                 st.session_state.historical_df = bars
                 st.session_state.historical_key = requested_key
@@ -724,14 +968,28 @@ with left:
             chart_area.warning("No historical bars returned for this symbol.")
             table_area.markdown("")
         else:
-            display_df = prepare_historical_display_df(df, timeframe_unit)
+            analysis_df = add_selected_indicators(df, selected_indicators)
+            display_df = prepare_historical_display_df(analysis_df, timeframe_unit)
+            lower_windows = selected_lower_indicator_windows(
+                display_df,
+                selected_indicators,
+            )
+            rows = 2 + len(lower_windows)
+            if lower_windows:
+                row_heights = [
+                    0.58,
+                    0.16,
+                    *([0.26 / len(lower_windows)] * len(lower_windows)),
+                ]
+            else:
+                row_heights = [0.74, 0.26]
 
             fig = make_subplots(
-                rows=2,
+                rows=rows,
                 cols=1,
                 shared_xaxes=True,
-                row_heights=[0.72, 0.28],
-                vertical_spacing=0.05,
+                row_heights=row_heights,
+                vertical_spacing=0.025,
             )
 
             fig.add_trace(
@@ -742,29 +1000,66 @@ with left:
                     low=display_df["low"],
                     close=display_df["close"],
                     name="Price",
+                    increasing_line_color=BULLISH_COLOR,
+                    increasing_fillcolor=BULLISH_COLOR,
+                    decreasing_line_color=BEARISH_COLOR,
+                    decreasing_fillcolor=BEARISH_COLOR,
                 ),
                 row=1,
                 col=1,
             )
 
+            add_selected_indicator_traces(
+                fig,
+                display_df,
+                selected_indicators,
+                row=1,
+                col=1,
+            )
+
+            volume_colors = [
+                BULLISH_BAR_COLOR
+                if close >= open_
+                else BEARISH_BAR_COLOR
+                for open_, close in zip(display_df["open"], display_df["close"])
+            ]
             fig.add_trace(
                 go.Bar(
                     x=display_df["timestamp"],
                     y=display_df["volume"],
                     name="Volume",
+                    marker_color=volume_colors,
+                    opacity=0.85,
+                    showlegend=False,
                 ),
                 row=2,
                 col=1,
             )
 
+            for offset, indicator_name in enumerate(lower_windows, start=3):
+                add_lower_indicator_window(fig, display_df, indicator_name, offset)
+
             fig.update_layout(
-                height=640,
+                height=640 + 115 * len(lower_windows),
+                margin={"l": 15, "r": 15, "t": 20, "b": 60},
                 xaxis_rangeslider_visible=False,
+                bargap=0,
+                legend={
+                    "orientation": "h",
+                    "yanchor": "top",
+                    "y": -0.12,
+                    "xanchor": "center",
+                    "x": 0.5,
+                    "font": {"size": 10},
+                    "itemsizing": "constant",
+                },
             )
 
+            fig.update_yaxes(title_text="Price", row=1, col=1)
+            fig.update_yaxes(title_text="Volume", row=2, col=1)
             fig.update_xaxes(
                 title_text="Time (E.T.)",
-                row=2,
+                row=rows,
                 col=1,
             )
 
@@ -774,17 +1069,11 @@ with left:
 
             # Fixed deprecation warning:
             # use_container_width=True -> width="stretch"
-            table_area.dataframe(display_df.tail(50), width="stretch")
+            with table_area.expander("OHLCV Table", expanded=False):
+                st.dataframe(display_df.tail(50), width="stretch")
 
 
-with right:
-    st.subheader("Live Quote")
-
-    # Only this quote area refreshes automatically.
-    # The chart/table/sidebar will not refresh every second anymore.
-    render_live_quote(symbol, is_valid_symbol)
-
-
-st.divider()
-with st.expander("ML Trading Signal", expanded=False):
-    render_ml_trading_panel(symbol, is_valid_symbol)
+with trading_panel:
+    render_strategy_management_panel(equity_options, equity_by_label)
+    st.divider()
+    render_paper_account_panel()
